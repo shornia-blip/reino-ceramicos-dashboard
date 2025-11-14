@@ -1,0 +1,9 @@
+# Archivos de datos locales
+*.json
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
