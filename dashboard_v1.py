@@ -3,8 +3,11 @@ from dash import dcc, html
 import plotly.express as px
 import pandas as pd
 from dash.dependencies import Input, Output
-from datetime import datetime
-import re # Importamos 're' (Regular Expressions) para el parseo
+from datetime import datetime, timedelta
+import re 
+import requests # ¡NUEVO! Necesario para la API
+import json     # ¡NUEVO!
+import os       # ¡NUEVO! Para leer las variables de entorno
 
 # --- Constantes de Estilo (¡ACTUALIZADAS!) ---
 COLOR_FONDO = "#222222" # Fondo oscuro
@@ -13,28 +16,100 @@ COLOR_KPI = "#333333"   # Fondo de tarjetas oscuro
 COLOR_BARRA_AZUL = "#0d1bd4" # Tu color azul
 KPI_BOX_SHADOW = "0 4px 6px rgba(0, 0, 0, 0.4)" # Sombra más oscura
 KPI_BORDER_RADIUS = "8px"
-ARCHIVO_DATOS = "yesterday_sample.json" # ¡IMPORTANTE! Leemos el archivo correcto
+# ARCHIVO_DATOS = "yesterday_sample.json" # <-- ELIMINADO. Ya no leemos de un archivo.
+
+# -------------------------------------------------------------------
+# ¡NUEVO! LECTURA DE VARIABLES DE ENTORNO (SECRETOS)
+# -------------------------------------------------------------------
+# Render pondrá los valores aquí desde su panel de control
+HIBOT_BASE_URL = os.environ.get("HIBOT_BASE_URL", "https://pdn.api.hibot.us/api_external")
+HIBOT_APP_ID = os.environ.get("HIBOT_APP_ID")
+HIBOT_APP_SECRET = os.environ.get("HIBOT_APP_SECRET")
+
+# -------------------------------------------------------------------
+# ¡NUEVO! LÓGICA DE EXTRACCIÓN DE DATOS (API)
+# -------------------------------------------------------------------
+
+def get_auth_token():
+    """
+    Obtiene el token de autenticación JWT desde la API de HiBot.
+    """
+    login_url = f"{HIBOT_BASE_URL}/login"
+    payload = {
+        "appId": HIBOT_APP_ID,
+        "appSecret": HIBOT_APP_SECRET
+    }
+    print(f"Solicitando token de {login_url}...")
+    try:
+        response = requests.post(login_url, json=payload)
+        response.raise_for_status() 
+        data = response.json()
+        token = data.get("token")
+        if token:
+            print("¡Token obtenido exitosamente!")
+            return token
+        print("Error: No se encontró 'token' en la respuesta.")
+        return None
+    except Exception as e:
+        print(f"Error al obtener token: {e}")
+        return None
+
+def fetch_live_data(token):
+    """
+    Obtiene las conversaciones del MES EN CURSO.
+    """
+    if not token:
+        print("No hay token, no se pueden obtener datos.")
+        return []
+
+    conversations_url = f"{HIBOT_BASE_URL}/conversations"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    # Lógica de Fecha: Mes en curso
+    hoy = datetime.now()
+    inicio_mes = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    # Convertimos a formato "timestamp" en milisegundos
+    timestamp_from = int(inicio_mes.timestamp() * 1000)
+    timestamp_to = int(hoy.timestamp() * 1000) # Hasta el momento actual
+
+    filter_payload = {
+        "from": timestamp_from,
+        "to": timestamp_to,
+    }
+    
+    print(f"Consultando conversaciones del mes (desde {inicio_mes.date()})...")
+    
+    try:
+        response = requests.post(conversations_url, headers=headers, json=filter_payload)
+        response.raise_for_status()
+        conversations_data = response.json()
+        print(f"¡Éxito! Se encontraron {len(conversations_data)} conversaciones.")
+        return conversations_data
+    except Exception as e:
+        print(f"Error al obtener conversaciones: {e}")
+        return [] # Devolver lista vacía en caso de error
 
 # --- Carga y Limpieza de Datos ---
-def cargar_datos():
+def cargar_datos(raw_data):
     """
-    Carga los datos desde ARCHIVO_DATOS y los prepara para el dashboard.
+    Procesa los datos JSON (desde la API) y los prepara para el dashboard.
     """
-    try:
-        # ¡CORREGIDO! Leemos el archivo correcto
-        df = pd.read_json(ARCHIVO_DATOS)
-    except ValueError as e:
-        print(f"Error al leer '{ARCHIVO_DATOS}'. Asegúrate de que el archivo existe y no está vacío.")
-        print("Recuerda ejecutar 'get_yesterday_sample.py' primero.")
-        print(f"Detalle: {e}")
+    if not raw_data:
+        print("No hay datos crudos para procesar.")
         return pd.DataFrame()
-    except FileNotFoundError:
-        print(f"Error: No se encontró el archivo '{ARCHIVO_DATOS}'.")
-        print("Por favor, ejecuta 'get_yesterday_sample.py' primero.")
+
+    try:
+        df = pd.DataFrame(raw_data)
+    except Exception as e:
+        print(f"Error al crear DataFrame: {e}")
         return pd.DataFrame()
 
     if df.empty:
-        print("El DataFrame está vacío (leído como '[]'). No hay datos para mostrar.")
+        print("El DataFrame está vacío. No hay datos para mostrar.")
         return df
 
     # --- VALIDACIÓN DE SEGURIDAD ---
@@ -50,7 +125,7 @@ def cargar_datos():
     # --- PREPARACIÓN DE DATOS ---
     
     # Extraer 'channelType'
-    if 'channel' in df.columns and isinstance(df['channel'].iloc[0], dict):
+    if 'channel' in df.columns and df['channel'].apply(isinstance, args=(dict,)).any():
         df['channelType'] = df['channel'].apply(lambda x: x.get('type') if isinstance(x, dict) else 'N/A')
     
     # --- ¡NUEVO! Parseo de 'agent' para 'PuntoDeVenta' y 'NombreAgenteLimpio' ---
@@ -105,13 +180,14 @@ def cargar_datos():
         df['hora_asignacion'] = df['assigned_dt'].dt.hour
     
     # --- FILTRO 2: DATOS DEL MES EN CURSO ---
+    # La API ya filtró por mes, pero volvemos a filtrar por si acaso
     if 'created' in df.columns:
         hoy = datetime.now()
         inicio_mes = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         df['created'] = df['created'].dt.tz_localize(None) # Hacemos naive para comparar
         df_filtrado = df[df['created'] >= inicio_mes].copy()
         
-        print(f"Datos originales leídos: {len(df)}. Datos del mes en curso: {len(df_filtrado)}")
+        print(f"Datos del mes en curso procesados: {len(df_filtrado)}")
         
         # Llenamos valores NaN en 'typing' para conteo
         if 'typing' in df_filtrado.columns:
@@ -121,8 +197,22 @@ def cargar_datos():
     
     return pd.DataFrame() # Devolver vacío si no hay 'created'
 
-# --- Cargar y Filtrar Datos ---
-df_mes_en_curso = cargar_datos()
+# --- ¡¡¡CAMBIO IMPORTANTE!!! ---
+# 1. OBTENER TOKEN
+# 2. OBTENER DATOS
+# 3. PROCESAR DATOS
+# Esto se ejecuta UNA SOLA VEZ cuando el servidor de Render se inicia.
+print("--- INICIANDO SERVIDOR DEL DASHBOARD ---")
+if not HIBOT_APP_ID or not HIBOT_APP_SECRET:
+    print("¡ERROR GRAVE! Faltan HIBOT_APP_ID o HIBOT_APP_SECRET en las variables de entorno.")
+    print("El dashboard se iniciará, pero no mostrará datos.")
+    df_mes_en_curso = pd.DataFrame()
+else:
+    api_token = get_auth_token()
+    raw_data_api = fetch_live_data(api_token)
+    df_mes_en_curso = cargar_datos(raw_data_api)
+print("----------------------------------------")
+
 
 # --- Calcular KPIs Principales (Requisito 3) ---
 total_conversaciones_mes = 0
@@ -293,7 +383,7 @@ app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Aria
         ]),
 
         # % DE CONVERSION COMPAÑIA
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1E%'}, children=[
+        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
             html.H3('% Conversión (WhatsApp)', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
             html.H2(f"{conversion_whatsapp:.2f}%", style={'color': '#28a745', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
         ]),
@@ -305,7 +395,7 @@ app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Aria
         ]),
 
         # TOTAL DE CONVERSACIONES typing "VENTA A CONFIRMAR"
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1S%'}, children=[
+        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
             html.H3('Total "Venta a Confirmar"', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
             html.H2(f"{total_venta_a_confirmar}", style={'color': '#ffc107', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
         ]),
