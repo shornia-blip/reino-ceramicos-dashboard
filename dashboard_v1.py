@@ -1,220 +1,210 @@
 import dash
 from dash import dcc, html
 import plotly.express as px
+import plotly.graph_objects as go
 import pandas as pd
 from dash.dependencies import Input, Output
 from datetime import datetime, timedelta
 import re 
-import requests # ¡NUEVO! Necesario para la API
-import json     # ¡NUEVO!
-import os       # ¡NUEVO! Para leer las variables de entorno
+import requests 
+import json      
+import os        
+import numpy as np 
 
-# --- Constantes de Estilo (¡ACTUALIZADAS!) ---
-COLOR_FONDO = "#222222" # Fondo oscuro
-COLOR_TEXTO = "#f0f0f0" # Texto claro
-COLOR_KPI = "#333333"   # Fondo de tarjetas oscuro
-COLOR_BARRA_AZUL = "#0d1bd4" # Tu color azul
-KPI_BOX_SHADOW = "0 4px 6px rgba(0, 0, 0, 0.4)" # Sombra más oscura
+# --- Constantes de Estilo y Colores ---
+COLOR_FONDO = "#222222" 
+COLOR_TEXTO = "#f0f0f0" 
+COLOR_KPI = "#333333"   
+COLOR_BARRA_AZUL = "#0d1bd4" # Azul de Reino Cerámicos
+KPI_BOX_SHADOW = "0 4px 6px rgba(0, 0, 0, 0.4)" 
 KPI_BORDER_RADIUS = "8px"
-# ARCHIVO_DATOS = "yesterday_sample.json" # <-- ELIMINADO. Ya no leemos de un archivo.
+ARCHIVO_LOCAL = "yesterday_sample.json" # Archivo de respaldo para desarrollo local
 
+# Colores específicos para canales (Requisito 10)
+CANAL_COLORS = {
+    'WhatsApp': "#1fff39",
+    'Facebook': "#1f23ff", 
+    'Instagram': "#8B2EEF",
+    'Mercado Libre': "#fff700", 
+    'N/A': 'gray'
+}
+
+# Orden fijo de días de la semana (Requisito 11)
+ORDEN_DIAS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+NOMBRES_DIAS_ES = {
+    'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miércoles',
+    'Thursday': 'Jueves', 'Friday': 'Viernes', 'Saturday': 'Sábado', 'Sunday': 'Domingo'
+}
+
+# --- OBJETIVOS (LÍNEAS GUÍA) ---
+OBJETIVO_POS_VENTA = 50 # Requisito 1: Conversaciones por Punto de Venta (Valor fijo)
+META_CONVERSION_WHATSAPP = 50 # Objetivo para la nueva barra horizontal 
+
+# Requisito 2: Conversaciones por Día de la Semana (Valores variables)
+OBJETIVO_SEMANAL = {
+    'Monday': 500, 'Tuesday': 500, 'Wednesday': 500, 'Thursday': 500, 'Friday': 500,
+    'Saturday': 275, 'Sunday': 115
+}
 # -------------------------------------------------------------------
-# ¡NUEVO! LECTURA DE VARIABLES DE ENTORNO (SECRETOS)
+# LÓGICA DE EXTRACCIÓN Y PROCESAMIENTO
 # -------------------------------------------------------------------
-# Render pondrá los valores aquí desde su panel de control
+
 HIBOT_BASE_URL = os.environ.get("HIBOT_BASE_URL", "https://pdn.api.hibot.us/api_external")
 HIBOT_APP_ID = os.environ.get("HIBOT_APP_ID")
 HIBOT_APP_SECRET = os.environ.get("HIBOT_APP_SECRET")
 
-# -------------------------------------------------------------------
-# ¡NUEVO! LÓGICA DE EXTRACCIÓN DE DATOS (API)
-# -------------------------------------------------------------------
-
 def get_auth_token():
-    """
-    Obtiene el token de autenticación JWT desde la API de HiBot.
-    """
-    login_url = f"{HIBOT_BASE_URL}/login"
-    payload = {
-        "appId": HIBOT_APP_ID,
-        "appSecret": HIBOT_APP_SECRET
-    }
-    print(f"Solicitando token de {login_url}...")
-    try:
-        response = requests.post(login_url, json=payload)
-        response.raise_for_status() 
-        data = response.json()
-        token = data.get("token")
-        if token:
-            print("¡Token obtenido exitosamente!")
-            return token
-        print("Error: No se encontró 'token' en la respuesta.")
+    """ Obtiene el token de autenticación JWT desde la API. """
+    if not HIBOT_APP_ID or not HIBOT_APP_SECRET:
+        print("Error: No se configuraron HIBOT_APP_ID/SECRET.")
         return None
+    try:
+        login_url = f"{HIBOT_BASE_URL}/login"
+        payload = {"appId": HIBOT_APP_ID, "appSecret": HIBOT_APP_SECRET}
+        print(f"Solicitando token a API...")
+        response = requests.post(login_url, json=payload, timeout=10)
+        response.raise_for_status() 
+        return response.json().get("token")
     except Exception as e:
-        print(f"Error al obtener token: {e}")
+        print(f"Error al obtener token API: {e}")
         return None
 
 def fetch_live_data(token):
-    """
-    Obtiene las conversaciones del MES EN CURSO.
-    """
-    if not token:
-        print("No hay token, no se pueden obtener datos.")
+    """ Obtiene las conversaciones del MES EN CURSO desde la API. """
+    if not token: return []
+    try:
+        conversations_url = f"{HIBOT_BASE_URL}/conversations"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        
+        hoy = datetime.now()
+        inicio_mes = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        timestamp_from = int(inicio_mes.timestamp() * 1000)
+        timestamp_to = int(hoy.timestamp() * 1000)
+
+        filter_payload = {"from": timestamp_from, "to": timestamp_to}
+        
+        print(f"Consultando API (desde {inicio_mes.date()})...")
+        response = requests.post(conversations_url, headers=headers, json=filter_payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        print(f"¡Éxito API! {len(data)} conversaciones descargadas.")
+        return data
+    except Exception as e:
+        print(f"Error al obtener datos de API: {e}")
         return []
 
-    conversations_url = f"{HIBOT_BASE_URL}/conversations"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    
-    # Lógica de Fecha: Mes en curso
-    hoy = datetime.now()
-    inicio_mes = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    
-    # Convertimos a formato "timestamp" en milisegundos
-    timestamp_from = int(inicio_mes.timestamp() * 1000)
-    timestamp_to = int(hoy.timestamp() * 1000) # Hasta el momento actual
-
-    filter_payload = {
-        "from": timestamp_from,
-        "to": timestamp_to,
-    }
-    
-    print(f"Consultando conversaciones del mes (desde {inicio_mes.date()})...")
-    
+def cargar_datos_locales():
+    """ Carga datos desde el archivo JSON local (Modo Desarrollo). """
+    print(f"Intentando cargar datos locales de '{ARCHIVO_LOCAL}'...")
     try:
-        response = requests.post(conversations_url, headers=headers, json=filter_payload)
-        response.raise_for_status()
-        conversations_data = response.json()
-        print(f"¡Éxito! Se encontraron {len(conversations_data)} conversaciones.")
-        return conversations_data
+        with open(ARCHIVO_LOCAL, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        print(f"¡Éxito Local! {len(data)} conversaciones cargadas del archivo.")
+        return data
+    except FileNotFoundError:
+        print(f"Error: No se encontró '{ARCHIVO_LOCAL}'. Ejecuta get_yesterday_sample.py primero.")
+        return []
     except Exception as e:
-        print(f"Error al obtener conversaciones: {e}")
-        return [] # Devolver lista vacía en caso de error
+        print(f"Error leyendo archivo local: {e}")
+        return []
 
-# --- Carga y Limpieza de Datos ---
-def cargar_datos(raw_data):
-    """
-    Procesa los datos JSON (desde la API) y los prepara para el dashboard.
-    """
-    if not raw_data:
-        print("No hay datos crudos para procesar.")
-        return pd.DataFrame()
+def procesar_dataframe(raw_data):
+    """ Convierte la lista de diccionarios en un DataFrame limpio y procesado. """
+    if not raw_data: return pd.DataFrame()
 
-    try:
-        df = pd.DataFrame(raw_data)
-    except Exception as e:
-        print(f"Error al crear DataFrame: {e}")
-        return pd.DataFrame()
+    df = pd.DataFrame(raw_data)
+    if df.empty: return df
 
-    if df.empty:
-        print("El DataFrame está vacío. No hay datos para mostrar.")
-        return df
+    # 1. Validación de columnas mínimas
+    if 'created' not in df.columns: return pd.DataFrame()
 
-    # --- VALIDACIÓN DE SEGURIDAD ---
-    # (Verificamos columnas clave)
-    columnas_requeridas = ['created', 'channel', 'typing', 'status', 'agent']
+    # 2. Parseo de Fechas
+    df['created'] = pd.to_datetime(df['created'], errors='coerce', unit='ms')
+    df['created'] = df['created'].dt.tz_localize(None)
     
-    columnas_faltantes = [col for col in columnas_requeridas if col not in df.columns]
-    if columnas_faltantes:
-        print("¡ADVERTENCIA DE DATOS!")
-        print(f"Faltan columnas esperadas: {columnas_faltantes}")
-        print(f"Columnas encontradas: {df.columns.to_list()}")
-        
-    # --- PREPARACIÓN DE DATOS ---
-    
-    # Extraer 'channelType'
-    if 'channel' in df.columns and df['channel'].apply(isinstance, args=(dict,)).any():
-        df['channelType'] = df['channel'].apply(lambda x: x.get('type') if isinstance(x, dict) else 'N/A')
-    
-    # --- ¡NUEVO! Parseo de 'agent' para 'PuntoDeVenta' y 'NombreAgenteLimpio' ---
+    df['hora_inicio'] = df['created'].dt.hour
+    df['dia_semana'] = df['created'].dt.day_name()
+    df['dia_mes'] = df['created'].dt.date
+    df['dia_mes_str'] = df['dia_mes'].apply(lambda x: x.strftime('%d-%m')) 
+
+    if 'assigned' in df.columns:
+        df['assigned_dt'] = pd.to_datetime(df['assigned'], errors='coerce', unit='ms')
+        df['assigned_dt'] = df['assigned_dt'].dt.tz_localize(None)
+        df['hora_asignacion'] = df['assigned_dt'].dt.hour
+    else:
+        df['hora_asignacion'] = np.nan 
+
+    # 3. Extracción channelType
+    if 'channel' in df.columns:
+        def get_channel_type(x):
+            if isinstance(x, dict): return x.get('type', 'N/A')
+            return 'N/A'
+        df['channelType'] = df['channel'].apply(get_channel_type)
+        # Limpieza de nombres
+        df['channelType'] = df['channelType'].replace({'WHATSAPP': 'WhatsApp', 'FACEBOOK': 'Facebook', 'INSTAGRAM': 'Instagram', 'MERCADOLIBRE': 'Mercado Libre'})
+
+    # 4. Parseo de Agente y Punto de Venta (Lógica compleja)
     if 'agent' in df.columns:
-        # 1. Obtenemos el nombre crudo (Ej: "R18 V - MAURICIO PUCHETA")
-        df['agentNameRaw'] = df['agent'].apply(lambda x: x.get('name') if isinstance(x, dict) else 'Sin Agente')
-        df['agentNameRaw'] = df['agentNameRaw'].fillna('Sin Agente')
-
-        # 2. Definimos la función de parseo
-        def parse_agent_name(name_raw):
-            if ' - ' not in name_raw:
-                return 'Sin Asignar', 'Sin Agente' # Caso "Sin Agente" o BOTS
+        def get_agent_name(x):
+            if isinstance(x, dict): return x.get('name', 'Sin Agente')
+            return 'N/A' # Corregido: Si no hay agente, no se puede asignar PV.
+        
+        # Usamos .apply(lambda x: x if isinstance(x, dict) else {'name': 'Sin Agente'}).str.get('name') para manejar nulos/cadenas
+        df['agentNameRaw'] = df['agent'].apply(get_agent_name).fillna('N/A')
+        
+        # Lógica de Parseo Rxx / VD
+        def parse_agent(name_raw):
+            if not isinstance(name_raw, str) or ' - ' not in name_raw: return 'Sin Asignar', 'Sin Agente'
             
-            # Dividimos en header ("R18 V") y nombre ("MAURICIO PUCHETA")
             parts = name_raw.split(' - ', 1)
-            header = parts[0]
-            agent_name = parts[1] if len(parts) > 1 else 'Nombre Desconocido'
-            
-            # Caso Especial "VD" (CANAL DIGITAL)
-            if " VD" in header:
-                pos = "CANAL DIGITAL"
+            header = parts[0].strip()
+            name_clean = parts[1].strip()
+
+            if "VD" in header: pos = "CANAL DIGITAL"
             else:
-                # Extraemos el código "Rxx" (Ej: "R18")
                 match = re.match(r'^(R\d+)', header)
-                if match:
-                    pos_code = match.group(1)
-                    pos = f"Reino {pos_code[1:]}" # Convierte "R18" a "Reino 18"
-                else:
-                    pos = 'Otro' # Fallback si no coincide el patrón
-            
-            return pos, agent_name
+                pos = f"Reino {match.group(1)[1:]}" if match else 'Otro'
+            return pos, name_clean
 
-        # 3. Aplicamos la función para crear las dos nuevas columnas
-        parsed_data = df['agentNameRaw'].apply(parse_agent_name)
-        df['PuntoDeVenta'] = parsed_data.apply(lambda x: x[0])
-        df['NombreAgenteLimpio'] = parsed_data.apply(lambda x: x[1])
+        # Filtrar solo si hay un agente válido para intentar el parseo
+        df_has_agent = df[df['agentNameRaw'] != 'N/A'].copy()
+        parsed = df_has_agent['agentNameRaw'].apply(parse_agent)
+        df_has_agent['PuntoDeVenta'] = parsed.apply(lambda x: x[0])
+        df_has_agent['NombreAgenteLimpio'] = parsed.apply(lambda x: x[1])
 
+        # Rellenar el DataFrame original
+        df['PuntoDeVenta'] = df.apply(lambda row: df_has_agent.loc[row.name, 'PuntoDeVenta'] if row.name in df_has_agent.index else 'N/A', axis=1)
+        df['NombreAgenteLimpio'] = df.apply(lambda row: df_has_agent.loc[row.name, 'NombreAgenteLimpio'] if row.name in df_has_agent.index else 'N/A', axis=1)
     else:
         df['PuntoDeVenta'] = 'N/A'
         df['NombreAgenteLimpio'] = 'N/A'
 
-    # Convertir fechas (usamos 'created' para casi todo)
-    if 'created' in df.columns:
-        df['created'] = pd.to_datetime(df['created'], errors='coerce', unit='ms')
-        df['hora_inicio'] = df['created'].dt.hour
-        df['dia_semana'] = df['created'].dt.day_name()
-        df['dia_mes'] = df['created'].dt.date
-    
-    # Convertir 'assigned' si existe
-    if 'assigned' in df.columns:
-        df['assigned_dt'] = pd.to_datetime(df['assigned'], errors='coerce', unit='ms')
-        df['hora_asignacion'] = df['assigned_dt'].dt.hour
-    
-    # --- FILTRO 2: DATOS DEL MES EN CURSO ---
-    # La API ya filtró por mes, pero volvemos a filtrar por si acaso
-    if 'created' in df.columns:
-        hoy = datetime.now()
-        inicio_mes = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        df['created'] = df['created'].dt.tz_localize(None) # Hacemos naive para comparar
-        df_filtrado = df[df['created'] >= inicio_mes].copy()
-        
-        print(f"Datos del mes en curso procesados: {len(df_filtrado)}")
-        
-        # Llenamos valores NaN en 'typing' para conteo
-        if 'typing' in df_filtrado.columns:
-            df_filtrado['typing'] = df_filtrado['typing'].fillna('N/A')
-        
-        return df_filtrado
-    
-    return pd.DataFrame() # Devolver vacío si no hay 'created'
 
-# --- ¡¡¡CAMBIO IMPORTANTE!!! ---
-# 1. OBTENER TOKEN
-# 2. OBTENER DATOS
-# 3. PROCESAR DATOS
-# Esto se ejecuta UNA SOLA VEZ cuando el servidor de Render se inicia.
-print("--- INICIANDO SERVIDOR DEL DASHBOARD ---")
-if not HIBOT_APP_ID or not HIBOT_APP_SECRET:
-    print("¡ERROR GRAVE! Faltan HIBOT_APP_ID o HIBOT_APP_SECRET en las variables de entorno.")
-    print("El dashboard se iniciará, pero no mostrará datos.")
-    df_mes_en_curso = pd.DataFrame()
+    # 5. Filtro por Mes en Curso
+    hoy = datetime.now()
+    inicio_mes = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    df_filtrado = df[df['created'] >= inicio_mes].copy()
+    
+    if 'typing' in df_filtrado.columns:
+        df_filtrado['typing'] = df_filtrado['typing'].fillna('N/A')
+    
+    return df_filtrado
+
+# --- BLOQUE PRINCIPAL DE CARGA DE DATOS ---
+print("--- INICIANDO CARGA DE DATOS ---")
+if HIBOT_APP_ID and HIBOT_APP_SECRET:
+    print("Modo detectado: PRODUCCIÓN (API)")
+    token = get_auth_token()
+    raw_data = fetch_live_data(token)
 else:
-    api_token = get_auth_token()
-    raw_data_api = fetch_live_data(api_token)
-    df_mes_en_curso = cargar_datos(raw_data_api)
-print("----------------------------------------")
+    print("Modo detectado: DESARROLLO LOCAL (Archivo JSON)")
+    raw_data = cargar_datos_locales()
 
+df_mes_en_curso = procesar_dataframe(raw_data)
+print(f"Conversaciones procesadas para el mes: {len(df_mes_en_curso)}")
+print("--------------------------------")
 
-# --- Calcular KPIs Principales (Requisito 3) ---
+# --- CÁLCULO DE KPIS ---
 total_conversaciones_mes = 0
 total_conversaciones_hoy = 0
 total_venta = 0
@@ -225,244 +215,437 @@ total_reclamo = 0
 conversion_whatsapp = 0.0
 
 if not df_mes_en_curso.empty:
-    # KPI: TOTAL DE CONVERSACIONES ACUMULADAS MES
+    hoy_fecha = datetime.now().date()
     total_conversaciones_mes = len(df_mes_en_curso)
+    total_conversaciones_hoy = len(df_mes_en_curso[df_mes_en_curso['created'].dt.date == hoy_fecha])
     
-    # KPI: TOTAL DE CONVERSACIONES HOY
-    hoy_normal = datetime.now().date()
-    total_conversaciones_hoy = len(df_mes_en_curso[df_mes_en_curso['created'].dt.date == hoy_normal])
-    
-    # KPIs por 'typing'
-    total_venta = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA'])
-    total_venta_a_confirmar = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA A CONFIRMAR'])
-    total_venta_perdida = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA PERDIDA'])
-    total_otro_motivo = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'OTRO MOTIVO'])
-    total_reclamo = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'RECLAMO'])
+    if 'typing' in df_mes_en_curso.columns:
+        total_venta = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA'])
+        total_venta_a_confirmar = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA A CONFIRMAR'])
+        total_venta_perdida = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA PERDIDA'])
+        total_otro_motivo = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'OTRO MOTIVO'])
+        total_reclamo = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'RECLAMO'])
 
-    # KPI: % DE CONVERSION COMPAÑIA (Solo WhatsApp)
-    df_whatsapp = df_mes_en_curso[df_mes_en_curso['channelType'] == 'WHATSAPP']
-    total_whatsapp = len(df_whatsapp)
-    ventas_whatsapp = len(df_whatsapp[df_whatsapp['typing'] == 'VENTA'])
-    
-    if total_whatsapp > 0:
-        conversion_whatsapp = (ventas_whatsapp / total_whatsapp) * 100
-
-# --- Crear Gráficos (Requisito 4) ---
-# (Creamos figuras vacías por si acaso)
-fig_diaria_mes = px.bar(title="Conversaciones Diarias (Mes en Curso)")
-fig_canal_torta = px.pie(title="Participación por Canal")
-fig_hora_creacion = px.bar(title="Conversaciones por Hora de Creación (0-23hs)")
-fig_hora_asignacion = px.bar(title="Conversaciones por Hora de Asignación (9-18hs)")
-fig_dia_semana = px.bar(title="Conversaciones por Día de la Semana")
-fig_pos_bar = px.bar(title="Conversaciones por Punto de Venta (Mes)") # ¡NUEVO!
-fig_agente_bar = px.bar(title="Conversaciones por Agente (Mes)") # Actualizado
-
-if not df_mes_en_curso.empty:
-    
-    # GRAFICO MENSUAL DE CONVERSACIONES DIARIAS
-    if 'dia_mes' in df_mes_en_curso.columns:
-        data_diaria = df_mes_en_curso.groupby('dia_mes').size().reset_index(name='conteo')
-        fig_diaria_mes = px.bar(data_diaria, x='dia_mes', y='conteo', 
-                                title="Conversaciones Diarias (Mes en Curso)",
-                                color_discrete_sequence=[COLOR_BARRA_AZUL],
-                                text_auto=True) # <-- ETIQUETA DE DATOS
-
-    # GRAFICO DE PARTICIPACION POR CANAL (TORTA)
     if 'channelType' in df_mes_en_curso.columns:
-        data_canal = df_mes_en_curso.groupby('channelType').size().reset_index(name='conteo')
-        fig_canal_torta = px.pie(data_canal, names='channelType', values='conteo', 
-                                 title="Participación por Canal")
+        df_wp = df_mes_en_curso[df_mes_en_curso['channelType'] == 'WhatsApp']
+        if len(df_wp) > 0:
+            ventas_wp = len(df_wp[df_wp['typing'] == 'VENTA'])
+            conversion_whatsapp = (ventas_wp / len(df_wp)) * 100
 
-    # GRAFICO ACUMULADO MENSUAL DE CONVERSACIONES POR HORA (CREACION)
-    if 'hora_inicio' in df_mes_en_curso.columns:
-        data_hora_creacion = df_mes_en_curso.groupby('hora_inicio').size().reset_index(name='conteo')
-        fig_hora_creacion = px.bar(data_hora_creacion, x='hora_inicio', y='conteo', 
-                                   title="Conversaciones por Hora de Creación (0-23hs)",
-                                   color_discrete_sequence=[COLOR_BARRA_AZUL],
-                                   text_auto=True)
-        fig_hora_creacion.update_xaxes(type='category') 
+# --- CREACIÓN DE BARRA DE CUMPLIMIENTO HORIZONTAL (Requisito 8) ---
+def create_horizontal_bar(value):
+    """ Crea un gráfico de barra horizontal para la conversión de WhatsApp con meta. """
+    # Definición de rangos y colores (manteniendo la lógica del velocímetro)
+    if value < 15.01: color = '#dc3545' # Rojo
+    elif value < 25.01: color = '#ffc107' # Amarillo
+    elif value < 49.01: color = '#28a745' # Verde
+    else: color = COLOR_BARRA_AZUL # Azul
+    
+    # Asegurar que el valor no exceda el 100% para el gráfico
+    display_value = min(value, 100.0)
+    
+    fig = go.Figure(go.Bar(
+        y=['CONVERSIÓN WHATSAPP'],
+        x=[display_value],
+        orientation='h',
+        name='Cumplimiento',
+        marker={'color': color},
+        hovertemplate='%{x:.1f}%<extra></extra>',
+        text=[f'{value:.1f}%'],
+        textposition='inside' # Ubicación del texto de porcentaje dentro de la barra
+    ))
 
-    # GRAFICO MENSUAL DE CONVERSACIONES POR HORA (ASIGNACION 9-18HS)
-    if 'hora_asignacion' in df_mes_en_curso.columns:
-        df_asig_filtrado = df_mes_en_curso[
-            (df_mes_en_curso['hora_asignacion'] >= 9) & 
-            (df_mes_en_curso['hora_asignacion'] <= 18)
-        ]
-        data_hora_asig = df_asig_filtrado.groupby('hora_asignacion').size().reset_index(name='conteo')
-        fig_hora_asignacion = px.bar(data_hora_asig, x='hora_asignacion', y='conteo', 
-                                     title="Conversaciones por Hora de Asignación (9-18hs)",
-                                     color_discrete_sequence=[COLOR_BARRA_AZUL],
-                                     text_auto=True)
-        fig_hora_asignacion.update_xaxes(type='category')
-        
-    # CANTIDAD DE CONVERSACIONES ACUMULADAS POR DIA DE LA SEMANA (ORDENADO)
-    if 'dia_semana' in df_mes_en_curso.columns:
-        data_dia_sem = df_mes_en_curso.groupby('dia_semana').size().reset_index(name='conteo')
-        data_dia_sem = data_dia_sem.sort_values(by='conteo', ascending=False)
-        fig_dia_semana = px.bar(data_dia_sem, x='dia_semana', y='conteo', 
-                                title="ConversACIONES por Día de la Semana (Más a Menos)",
-                                color_discrete_sequence=[COLOR_BARRA_AZUL],
-                                text_auto=True)
-
-    # --- ¡NUEVO! GRAFICO POR PUNTO DE VENTA (ORDENADO) ---
-    if 'PuntoDeVenta' in df_mes_en_curso.columns:
-        data_pos = df_mes_en_curso.groupby('PuntoDeVenta').size().reset_index(name='conteo')
-        data_pos = data_pos.sort_values(by='conteo', ascending=False)
-        fig_pos_bar = px.bar(data_pos, x='PuntoDeVenta', y='conteo', 
-                             title="Conversaciones por Punto de Venta (Mes)",
-                             color_discrete_sequence=[COLOR_BARRA_AZUL],
-                             text_auto=True)
-
-    # --- ¡ACTUALIZADO! GRAFICO POR AGENTE (ORDENADO) ---
-    if 'NombreAgenteLimpio' in df_mes_en_curso.columns:
-        data_agente = df_mes_en_curso.groupby('NombreAgenteLimpio').size().reset_index(name='conteo')
-        # Filtramos agentes con pocas conversaciones para que el gráfico sea legible
-        data_agente = data_agente[data_agente['conteo'] > 1] # Opcional: ajustar este filtro
-        data_agente = data_agente.sort_values(by='conteo', ascending=False)
-        fig_agente_bar = px.bar(data_agente, x='NombreAgenteLimpio', y='conteo', 
-                                title="Conversaciones por Agente (Mes)",
-                                color_discrete_sequence=[COLOR_BARRA_AZUL],
-                                text_auto=True)
-
-# --- ¡NUEVO! APLICAR ESTILOS DE MODO OSCURO A TODOS LOS GRÁFICOS ---
-list_of_figures = [
-    fig_diaria_mes, fig_canal_torta, fig_hora_creacion, 
-    fig_hora_asignacion, fig_dia_semana, fig_pos_bar, fig_agente_bar
-]
-
-for fig in list_of_figures:
+    # Configuración de layout
     fig.update_layout(
-        plot_bgcolor=COLOR_KPI,     # Fondo del área del gráfico
-        paper_bgcolor=COLOR_KPI,    # Fondo de la tarjeta del gráfico
-        font_color=COLOR_TEXTO,     # Color del texto (ejes, etiquetas)
-        font_family="Arial",        # Tipografía de datos (ejes)
-        title_font_family="Open Sans", # Tipografía de títulos
-        title_font_weight="bold"        # Negrita para títulos
+        title={
+            'text': "% CONVERSIÓN WHATSAPP", 
+            'y':0.95, 'x':0.5, 'xanchor': 'center', 'yanchor': 'top',
+            'font': {'size': 18}
+        },
+        plot_bgcolor=COLOR_KPI, 
+        paper_bgcolor=COLOR_KPI, 
+        font_color=COLOR_TEXTO,
+        font_family="Arial",
+        # Altura ajustada para que quepa en el contenedor de 100px
+        height=90, 
+        margin=dict(t=30, b=0, l=10, r=10),
+        
+        # Eliminar ejes y fondo del gráfico
+        xaxis={'range': [0, 100], 'showgrid': False, 'showticklabels': False, 'zeroline': False},
+        yaxis={'showgrid': False, 'showticklabels': False, 'automargin': True}, # automargin para ajustar el texto del KPI
+        showlegend=False
     )
-    # Asegurar que las etiquetas de datos (texto en barras) sean claras
-    fig.update_traces(textfont_color=COLOR_TEXTO, textposition='outside')
+    
+    # Añadir línea de meta (Target: 50%)
+    fig.add_vline(
+        x=META_CONVERSION_WHATSAPP, 
+        line_width=2, 
+        line_dash="dash", 
+        line_color="#11fb00" # verde para la meta
+    )
+    fig.add_annotation(
+        x=META_CONVERSION_WHATSAPP, 
+        y=1.2, # Posición en la parte superior del gráfico
+        yref="paper",
+        text=f"KPI {META_CONVERSION_WHATSAPP}%", 
+        showarrow=False, 
+        font=dict(color="#ffffff", size=12),
+        xshift=-5 # Mover la anotación un poco a la izquierda de la línea
+    )
+    
+    return fig
+
+# Reemplazamos la llamada a create_gauge por la nueva función de barra horizontal.
+fig_horizontal_bar = create_horizontal_bar(conversion_whatsapp)
 
 
-# --- ¡NUEVO! Cargar Tipografías Externas ---
-external_stylesheets = [
-    'https://fonts.googleapis.com/css2?family=Open+Sans:wght@700&family=Arial&display=swap'
-]
-
-# --- Inicializar la App Dash ---
+# --- APP LAYOUT ---
+external_stylesheets = ['https://fonts.googleapis.com/css2?family=Open+Sans:wght@700&family=Arial&display=swap']
 app = dash.Dash(__name__, external_stylesheets=external_stylesheets)
-# Necesario para Render:
 server = app.server
 
-# --- Layout de la Aplicación ---
-app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Arial', 'padding': '20px'}, children=[
+# Componente para las tarjetas KPI
+def tarjeta_kpi(titulo, valor, color_valor, ancho='23%'):
+    return html.Div(style={
+        'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS,
+        'boxShadow': KPI_BOX_SHADOW, 'width': ancho, 'textAlign': 'center', 'margin': '1%'
+    }, children=[
+        html.H3(titulo, style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '14px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
+        html.H2(str(valor), style={'color': color_valor, 'fontSize': '28px', 'margin': '5px 0 0 0', 'fontFamily': 'Arial'})
+    ])
+
+# Controles de Orden
+def control_orden(id_sufix, titulo, opciones):
+    return html.Div([
+        html.H4(titulo, style={'color': COLOR_TEXTO, 'fontSize': '16px', 'fontFamily': 'Open Sans', 'marginTop': '10px'}),
+        dcc.RadioItems(
+            id=f'radio-{id_sufix}',
+            options=[{'label': opt, 'value': val} for opt, val in opciones.items()],
+            value='FIJO', # Valor por defecto
+            labelStyle={'display': 'inline-block', 'marginRight': '20px', 'color': COLOR_TEXTO}
+        )
+    ], style={'padding': '10px', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'marginBottom': '20px'})
+
+
+app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Arial', 'padding': '20px', 'minHeight': '100vh'}, children=[
     
-    # --- Requisito 1: Aquí puedes editar el título ---
-    html.H1(
-        children='Tablero de control Digital - Reino Cerámicos',
-        style={'textAlign': 'center', 'color': COLOR_TEXTO, 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}
-    ),
+    html.H1('Tablero de control Digital - Reino Cerámicos', 
+            style={'textAlign': 'center', 'color': COLOR_TEXTO, 'fontFamily': 'Open Sans', 'fontWeight': 'bold', 'marginBottom': '5px'}),
+    html.P(f"Datos actualizados al: {datetime.now().strftime('%d/%m/%Y %H:%M')}", 
+           style={'textAlign': 'center', 'color': '#aaaaaa', 'marginTop': '0'}),
+
+    # Fila 1 de KPIs (Requisito 1, 2, 3, 4)
+    html.Div(style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[
+        # 1. TOTALES HOY
+        tarjeta_kpi('Conversaciones Hoy', total_conversaciones_hoy, '#17a2b8', ancho='19%'),
+        # 2. TOTALES MES
+        tarjeta_kpi('Conversaciones Acumuladas', total_conversaciones_mes, '#007bff', ancho='19%'),
+        # 3. VENTA
+        tarjeta_kpi('Ventas', total_venta, '#28a745', ancho='19%'),
+        # 4. VENTA A CONFIRMAR
+        tarjeta_kpi('Ventas a Confirmar', total_venta_a_confirmar, '#ffc107', ancho='19%'),
+    ]),    
     
-    html.P(
-        children=f"Mostrando datos del Mes en Curso (desde {datetime.now().strftime('%Y-%m-01')})",
-        style={'textAlign': 'center', 'color': '#aaaaaa'} # Texto de subtítulo más suave
-    ),
-
-    # --- Fila de KPIs (Requisito 3) ---
-    html.Div(style={'display': 'flex', 'justifyContent': 'space-around', 'margin': '20px 0', 'flexWrap': 'wrap'}, children=[
-        
-        # TOTAL DE CONVERSACIONES ACUMULADAS MES
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
-            html.H3('Total Conversaciones (Mes)', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
-            html.H2(f"{total_conversaciones_mes}", style={'color': '#007bff', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
-        ]),
-        
-        # TOTAL DE CONVERSACIONES HOY
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
-            html.H3('Total Conversaciones (Hoy)', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
-            html.H2(f"{total_conversaciones_hoy}", style={'color': '#17a2b8', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
-        ]),
-
-        # % DE CONVERSION COMPAÑIA
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
-            html.H3('% Conversión (WhatsApp)', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
-            html.H2(f"{conversion_whatsapp:.2f}%", style={'color': '#28a745', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
-        ]),
-        
-        # TOTAL DE CONVERSACIONES typing "VENTA"
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
-            html.H3('Total "Venta"', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
-            html.H2(f"{total_venta}", style={'color': '#28a745', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
-        ]),
-
-        # TOTAL DE CONVERSACIONES typing "VENTA A CONFIRMAR"
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
-            html.H3('Total "Venta a Confirmar"', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
-            html.H2(f"{total_venta_a_confirmar}", style={'color': '#ffc107', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
-        ]),
-
-        # TOTAL DE CONVERSACIONES typing "VENTA PERDIDA"
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
-            html.H3('Total "Venta Perdida"', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
-            html.H2(f"{total_venta_perdida}", style={'color': '#dc3545', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
-        ]),
-
-        # TOTAL DE CONVERSACIONES typing "OTRO MOTIVO"
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
-            html.H3('Total "Otro Motivo"', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
-            html.H2(f"{total_otro_motivo}", style={'color': '#6c757d', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
-        ]),
-
-        # TOTAL DE CONVERSACIONES typing "RECLAMO"
-        html.Div(style={'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'width': '23%', 'textAlign': 'center', 'margin': '1%'}, children=[
-            html.H3('Total "Reclamo"', style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '16px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
-            html.H2(f"{total_reclamo}", style={'color': '#fd7e14', 'fontSize': '32px', 'margin': '10px 0 0 0', 'fontFamily': 'Arial'})
-        ]),
+    # Fila 2 de KPIs (Requisito 5, 6, 7 y la nueva barra)
+    html.Div(style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[
+        # 5. VENTA PERDIDA
+        tarjeta_kpi('Ventas Perdidas', total_venta_perdida, '#dc3545', ancho='27%'),
+        # 6. OTRO MOTIVO
+        tarjeta_kpi('Otro Motivo', total_otro_motivo, '#adb5bd', ancho='27%'),
+        # 7. RECLAMO
+        tarjeta_kpi('Reclamos', total_reclamo, '#fd7e14', ancho='27%'),
     ]),
 
-    # --- Fila de Gráficos (Requisito 4) ---
-    html.Div(style={'display': 'flex', 'justifyContent': 'space-around', 'margin': '20px 0', 'flexWrap': 'wrap'}, children=[
-        dcc.Graph(
-            id='graph-diaria-mes',
-            figure=fig_diaria_mes,
-            style={'width': '100%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '10px', 'margin': '10px'}
-        ),
-        dcc.Graph(
-            id='graph-canal-torta',
-            figure=fig_canal_torta,
-            style={'width': '48%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '10px', 'margin': '10px'}
-        ),
-        dcc.Graph(
-            id='graph-dia-semana',
-            figure=fig_dia_semana,
-            style={'width': '48%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '10px', 'margin': '10px'}
-        ),
-        dcc.Graph(
-            id='graph-hora-creacion',
-            figure=fig_hora_creacion,
-            style={'width': '48%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '10px', 'margin': '10px'}
-        ),
-        dcc.Graph(
-            id='graph-hora-asignacion',
-            figure=fig_hora_asignacion,
-            style={'width': '48%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '10px', 'margin': '10px'}
-        ),
-        
-        # --- ¡NUEVOS GRÁFICOS REQUERIDOS! ---
-        dcc.Graph(
-            id='graph-pos-bar',
-            figure=fig_pos_bar,
-            style={'width': '48%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '10px', 'margin': '10px'}
-        ),
-         dcc.Graph(
-            id='graph-agente-bar',
-            figure=fig_agente_bar,
-            style={'width': '48%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '10px', 'margin': '10px'}
-        ),
+    # Fila 3 ahora solo contiene la barra horizontal de Conversión de WhatsApp
+    html.Div(style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[    
+        # 8. CONVERSIÓN WHATSAPP (Barra de Cumplimiento Horizontal)
+        html.Div(dcc.Graph(figure=fig_horizontal_bar, config={'displayModeBar': False}), 
+                 style={'width': '90%', 'height': '100px', 'margin': '1%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '5px'}),
     ]),
+
+    # Controles Interactivos
+    html.Div(style={'display': 'flex', 'justifyContent': 'space-around', 'flexWrap': 'wrap', 'margin': '20px 0'}, children=[
+        # Control para Torta Canal
+        control_orden('canal-display', 'Participación por Canal', {'Cantidad': 'COUNT', 'Porcentaje': 'PERCENT'}),
+        # Control para Día Semana
+        control_orden('dia-semana-order', 'Visualizar Conversaciones por día de:', {'Lunes - Domingo': 'FIJO', 'Mayor a Menor': 'DESC'}),
+        # Control para Hora Creación
+        control_orden('hora-creacion-order', 'Visualizar hora de creación de:', {'00 - 23hs': 'FIJO', 'Mayor a Menor': 'DESC'}),
+        # Control para Hora Asignación
+        control_orden('hora-asignacion-order', 'Visualizar hora de asignación de:', {'9 - 18hs': 'FIJO', 'Mayor a Menor': 'DESC'}),
+    ]),
+
+    # Gráficos de Contenido (Full Width / Half Width)
+    html.Div(style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'center'}, children=[
+        dcc.Graph(id='graph-diaria-mes', style={'width': '97%', 'margin': '10px'}), 
+        dcc.Graph(id='graph-canal-torta', style={'width': '48%', 'margin': '10px'}), 
+        dcc.Graph(id='graph-dia-semana', style={'width': '48%', 'margin': '10px'}), 
+        dcc.Graph(id='graph-hora-creacion', style={'width': '48%', 'margin': '10px'}), 
+        dcc.Graph(id='graph-hora-asignacion', style={'width': '48%', 'margin': '10px'}), 
+        dcc.Graph(id='graph-pos-bar', style={'width': '48%', 'margin': '10px'}), 
+        dcc.Graph(id='graph-agente-bar', style={'width': '48%', 'margin': '10px'}),
+    ])
 ])
 
-# --- Ejecutar la App ---
+# -------------------------------------------------------------------
+# LÓGICA INTERACTIVA (CALLBACKS DE DASH)
+# -------------------------------------------------------------------
+
+def aplicar_estilos_grafico(fig):
+    """ Función auxiliar para aplicar el tema oscuro a un gráfico. """
+    fig.update_layout(
+        plot_bgcolor=COLOR_KPI, paper_bgcolor=COLOR_KPI, font_color=COLOR_TEXTO,
+        font_family="Arial", title_font_family="Open Sans", title_font_weight="bold",
+        height=400, margin=dict(t=50, b=50, l=10, r=10)
+    )
+    # Mostramos texto fuera de las barras para contraste en tema oscuro.
+    fig.update_traces(textfont_color=COLOR_TEXTO, textposition='outside')
+    return fig
+
+
+# CALLBACK para Gráfico Diario (Requisito 9)
+@app.callback(
+    Output('graph-diaria-mes', 'figure'),
+    [Input('graph-diaria-mes', 'id')] 
+)
+def update_graph_diaria(_):
+    # Si no hay datos, devolvemos una figura vacía con el estilo.
+    if df_mes_en_curso.empty: 
+        return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos para el Mes")))
+    
+    # --- 1. Crear el rango completo de días del mes ---
+    hoy = datetime.now()
+    inicio_mes = hoy.replace(day=1).date()
+    
+    # Crear lista de fechas desde el 1 hasta hoy
+    dates = [inicio_mes + timedelta(days=i) for i in range((hoy.date() - inicio_mes).days + 1)]
+    dates_str = [d.strftime('%d-%m') for d in dates]
+    
+    df_full_month = pd.DataFrame({'dia_mes_str': dates_str})
+    
+    # 2. Agrupación y cuenta de datos reales
+    d_real = df_mes_en_curso.groupby('dia_mes_str').size().reset_index(name='conteo')
+    
+    # 3. Unir los datos reales con el rango completo y rellenar con 0
+    d = df_full_month.merge(d_real, on='dia_mes_str', how='left').fillna(0)
+    
+    # Asegurar que el conteo sea entero (para la etiqueta de datos)
+    d['conteo'] = d['conteo'].astype(int)
+    
+    # Crear el gráfico
+    fig = px.bar(d, x='dia_mes_str', y='conteo', 
+                 title="Conversaciones Diarias (Mes en Curso)",
+                 color_discrete_sequence=[COLOR_BARRA_AZUL],
+                 text_auto=True,
+                 category_orders={'dia_mes_str': dates_str}) # Esto asegura el orden correcto
+    
+    fig.update_xaxes(title_text="Fecha (Día-Mes)")
+    return aplicar_estilos_grafico(fig)
+
+
+# CALLBACK para Participación por Canal (Torta/Pie) (Requisito 10)
+@app.callback(
+    Output('graph-canal-torta', 'figure'),
+    [Input('radio-canal-display', 'value')]
+)
+def update_graph_canal(display_type):
+    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Canal")))
+
+    d = df_mes_en_curso.groupby('channelType').size().reset_index(name='conteo')
+    
+    if display_type == 'COUNT':
+        fig = px.pie(d, names='channelType', values='conteo', 
+                     title="Cantidad por Canal",
+                     color='channelType',
+                     color_discrete_map=CANAL_COLORS)
+        fig.update_traces(textinfo='value+label')
+    else:
+        fig = px.pie(d, names='channelType', values='conteo', 
+                     title="% por Canal",
+                     color='channelType',
+                     color_discrete_map=CANAL_COLORS)
+        fig.update_traces(textinfo='percent+label')
+        
+    return aplicar_estilos_grafico(fig)
+
+
+# CALLBACK para Día de la Semana (Barras) (Requisito 11)
+@app.callback(
+    Output('graph-dia-semana', 'figure'),
+    [Input('radio-dia-semana-order', 'value')]
+)
+def update_graph_dia_semana(order_type):
+    # Si no hay datos, devolvemos una figura vacía con el estilo.
+    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Día de Semana")))
+    
+    d = df_mes_en_curso.groupby('dia_semana').size().reset_index(name='conteo')
+    shapes = [] # Para las líneas guía
+
+    if order_type == 'FIJO':
+        # Corrección: reindexar y rellenar con 0 para evitar KeyError
+        d = d.set_index('dia_semana')['conteo'].reindex(ORDEN_DIAS).fillna(0).reset_index(name='conteo')
+        d['dia_semana_es'] = d['dia_semana'].map(NOMBRES_DIAS_ES)
+        order_list = [NOMBRES_DIAS_ES[day] for day in ORDEN_DIAS]
+        
+        fig = px.bar(d, x='dia_semana_es', y='conteo', 
+                     title="Conversaciones por Día (Lunes - Domingo)",
+                     color_discrete_sequence=[COLOR_BARRA_AZUL],
+                     text_auto=True, category_orders={'x': order_list})
+        
+        # --- Lógica de la Línea Guía (Objetivo) ---
+        for i, day in enumerate(ORDEN_DIAS):
+            objetivo = OBJETIVO_SEMANAL.get(day, 0) # Obtiene el objetivo o 0 si no existe
+            shapes.append(
+                # Dibujar la línea sobre cada barra del gráfico
+                go.layout.Shape(
+                    type="line",
+                    xref="x", yref="y",
+                    x0=i - 0.4, # Inicio de la barra
+                    y0=objetivo,
+                    x1=i + 0.4, # Fin de la barra
+                    y1=objetivo,
+                    line=dict(color="#fd7e14", width=2, dash="dot")
+                )
+            )
+
+    else:
+        d['dia_semana_es'] = d['dia_semana'].map(NOMBRES_DIAS_ES)
+        d = d.sort_values('conteo', ascending=False)
+        fig = px.bar(d, x='dia_semana_es', y='conteo', 
+                     title="Conversaciones por Día (Mayor a Menor)",
+                     color_discrete_sequence=[COLOR_BARRA_AZUL],
+                     text_auto=True)
+    
+    fig.update_xaxes(title_text="Día de la Semana")
+    
+    # Añadir las formas (líneas guía) solo en modo fijo
+    if order_type == 'FIJO':
+        fig.update_layout(shapes=shapes)
+        
+    return aplicar_estilos_grafico(fig)
+
+
+# CALLBACK para Hora de Creación (Requisito 12)
+@app.callback(
+    Output('graph-hora-creacion', 'figure'),
+    [Input('radio-hora-creacion-order', 'value')]
+)
+def update_graph_hora_creacion(order_type):
+    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Hora de Creación")))
+    
+    all_hours = pd.DataFrame({'hora_inicio': range(24)})
+    d = df_mes_en_curso.groupby('hora_inicio').size().reset_index(name='conteo')
+    d = all_hours.merge(d, on='hora_inicio', how='left').fillna(0) # Rellenar horas sin datos con 0
+
+    if order_type == 'FIJO':
+        fig = px.bar(d, x='hora_inicio', y='conteo', 
+                     title="Caída de conversaciones (00 - 23hs)",
+                     color_discrete_sequence=[COLOR_BARRA_AZUL],
+                     text_auto=True, category_orders={'x': [str(h) for h in range(24)]})
+    else:
+        d = d.sort_values('conteo', ascending=False)
+        fig = px.bar(d, x='hora_inicio', y='conteo', 
+                     title="Caída de conversaciones (+ → -)",
+                     color_discrete_sequence=[COLOR_BARRA_AZUL],
+                     text_auto=True)
+    
+    fig.update_xaxes(title_text="Hora del Día", type='category')
+    return aplicar_estilos_grafico(fig)
+
+
+# CALLBACK para Hora de Asignación (Requisito 13)
+@app.callback(
+    Output('graph-hora-asignacion', 'figure'),
+    [Input('radio-hora-asignacion-order', 'value')]
+)
+def update_graph_hora_asignacion(order_type):
+    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Hora de Asignación")))
+    
+    # Rango 9 a 18 (incluyendo 9 y 18)
+    d_fil = df_mes_en_curso[(df_mes_en_curso['hora_asignacion'] >= 9) & (df_mes_en_curso['hora_asignacion'] <= 18)].copy()
+    
+    all_hours = pd.DataFrame({'hora_asignacion': range(9, 19)})
+    d = d_fil.groupby('hora_asignacion').size().reset_index(name='conteo')
+    d = all_hours.merge(d, on='hora_asignacion', how='left').fillna(0) # Rellenar horas sin datos con 0
+
+    if order_type == 'FIJO':
+        fig = px.bar(d, x='hora_asignacion', y='conteo', 
+                     title="Asignación por hora (9 - 18hs)",
+                     color_discrete_sequence=[COLOR_BARRA_AZUL],
+                     text_auto=True, category_orders={'x': [str(h) for h in range(9, 19)]})
+    else:
+        d = d.sort_values('conteo', ascending=False)
+        fig = px.bar(d, x='hora_asignacion', y='conteo', 
+                     title="Asignación por hora (+ → -)",
+                     color_discrete_sequence=[COLOR_BARRA_AZUL],
+                     text_auto=True)
+    
+    fig.update_xaxes(title_text="Hora de Asignación", type='category')
+    return aplicar_estilos_grafico(fig)
+
+
+# CALLBACK para Punto de Venta (Barras) (Ordenado por defecto)
+@app.callback(
+    Output('graph-pos-bar', 'figure'),
+    [Input('radio-dia-semana-order', 'id')] 
+)
+def update_graph_pos(_):
+    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Punto de Venta")))
+    
+    d = df_mes_en_curso.groupby('PuntoDeVenta').size().reset_index(name='conteo')
+    d = d.sort_values('conteo', ascending=False)
+    
+    fig = px.bar(d, x='PuntoDeVenta', y='conteo', 
+                 title="Conversaciones por Punto de Venta (Mes)",
+                 color_discrete_sequence=[COLOR_BARRA_AZUL],
+                 text_auto=True)
+    
+    fig.update_xaxes(title_text="Punto de Venta")
+    
+    # --- Lógica de la Línea Guía (Objetivo 50) ---
+    fig.add_shape(
+        type="line",
+        xref="paper", yref="y", # xref="paper" significa el ancho completo del gráfico
+        x0=0, y0=OBJETIVO_POS_VENTA,
+        x1=1, y1=OBJETIVO_POS_VENTA,
+        line=dict(color="#fd7e14", width=2, dash="dot"),
+        name="Objetivo 50"
+    )
+    
+    # Añadir anotación (texto) para la línea
+    fig.add_annotation(
+        x=0.9, y=OBJETIVO_POS_VENTA,
+        text=f"Meta: {OBJETIVO_POS_VENTA}",
+        showarrow=False,
+        yanchor="bottom",
+        font=dict(color="#fd7e14", size=10)
+    )
+    
+    return aplicar_estilos_grafico(fig)
+
+
+# CALLBACK para Agente (Barras) (Ordenado por defecto)
+@app.callback(
+    Output('graph-agente-bar', 'figure'),
+    [Input('radio-dia-semana-order', 'id')] 
+)
+def update_graph_agente(_):
+    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Agente")))
+    
+    d = df_mes_en_curso.groupby('NombreAgenteLimpio').size().reset_index(name='conteo')
+    d = d[d['conteo'] > 0] 
+    d = d.sort_values('conteo', ascending=False).head(15) # Limitar a los 15 principales para visibilidad
+    
+    fig = px.bar(d, x='NombreAgenteLimpio', y='conteo', 
+                 title="Conversaciones por Agente (Mes) - Top 15",
+                 color_discrete_sequence=[COLOR_BARRA_AZUL],
+                 text_auto=True)
+    
+    fig.update_xaxes(title_text="Agente")
+    return aplicar_estilos_grafico(fig)
+
+
 if __name__ == '__main__':
-    print("Iniciando servidor Dash en http://127.0.0.1:8050/")
-    # Corregimos el comando de ejecución
+    print("Iniciando servidor local...")
+    # Asegúrate de haber ejecutado get_yesterday_sample.py antes de este paso para tener datos.
     app.run(debug=True, port=8050)
