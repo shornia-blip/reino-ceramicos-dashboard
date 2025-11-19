@@ -2,4 +2,4 @@ dash
 pandas
 plotly
 requests
-gunicorn
+gunicorn # Servidor necesario para producción
