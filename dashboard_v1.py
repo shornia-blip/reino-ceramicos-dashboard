@@ -37,8 +37,14 @@ NOMBRES_DIAS_ES = {
 }
 
 # --- OBJETIVOS (LÍNEAS GUÍA) ---
-OBJETIVO_POS_VENTA = 50 # Requisito 1: Conversaciones por Punto de Venta (Valor fijo)
-META_CONVERSION_WHATSAPP = 50 # Objetivo para la nueva barra horizontal 
+# Objetivo diario POR PUNTO DE VENTA (Base)
+OBJETIVO_DIARIO_POR_PV = {
+    'Monday': 50, 'Tuesday': 50, 'Wednesday': 50, 'Thursday': 50, 'Friday': 50, # Lunes a Viernes: 50
+    'Saturday': 25, # Sábados: 25
+    'Sunday': 10  # Domingos: 10
+}
+OBJETIVO_POS_VENTA = 50 # Se mantiene como fallback, pero será sobreescrito por el cálculo acumulado.
+META_CONVERSION_WHATSAPP = 50 # Objetivo para la barra horizontal
 
 # Requisito 2: Conversaciones por Día de la Semana (Valores variables)
 OBJETIVO_SEMANAL = {
@@ -203,6 +209,29 @@ else:
 df_mes_en_curso = procesar_dataframe(raw_data)
 print(f"Conversaciones procesadas para el mes: {len(df_mes_en_curso)}")
 print("--------------------------------")
+
+# --- CÁLCULO DE OBJETIVO ACUMULADO POR PUNTO DE VENTA ---
+def calcular_objetivo_pos_venta_acumulado(hoy):
+    """ Calcula el objetivo acumulado para un Punto de Venta hasta la fecha actual. """
+    inicio_mes = hoy.replace(day=1).date()
+    objetivo_acumulado = 0
+    
+    # Recorrer todos los días desde el inicio del mes hasta hoy
+    current_date = inicio_mes
+    while current_date <= hoy.date():
+        # Obtener el nombre del día en inglés (ej: 'Monday')
+        day_name = current_date.strftime('%A')
+        
+        # Sumar el objetivo diario para ese día
+        objetivo_acumulado += OBJETIVO_DIARIO_POR_PV.get(day_name, 0)
+        
+        # Mover al siguiente día
+        current_date += timedelta(days=1)
+        
+    return objetivo_acumulado
+
+# Calcular el objetivo acumulado utilizando el día actual
+OBJETIVO_POS_VENTA_ACUMULADO = calcular_objetivo_pos_venta_acumulado(datetime.now())
 
 # --- CÁLCULO DE KPIS ---
 total_conversaciones_mes = 0
@@ -439,7 +468,17 @@ def update_graph_diaria(_):
                  text_auto=True,
                  category_orders={'dia_mes_str': dates_str}) # Esto asegura el orden correcto
     
-    fig.update_xaxes(title_text="Fecha (Día-Mes)")
+    # **INICIO DE LA CORRECCIÓN**
+    fig.update_xaxes(
+        title_text="Fecha (Día-Mes)",
+        # Forzar el tipo de eje a 'category' para evitar que Plotly lo interprete como tiempo
+        type='category', 
+        # Asegurarse de que el orden de las categorías sea el que acabamos de crear (dates_str)
+        categoryorder='array',
+        categoryarray=dates_str
+    )
+    # **FIN DE LA CORRECCIÓN**
+
     return aplicar_estilos_grafico(fig)
 
 
@@ -602,20 +641,23 @@ def update_graph_pos(_):
     
     fig.update_xaxes(title_text="Punto de Venta")
     
-    # --- Lógica de la Línea Guía (Objetivo 50) ---
+    # --- Lógica de la Línea Guía (Objetivo Acumulado) ---
+    # Usamos OBJETIVO_POS_VENTA_ACUMULADO para la línea.
+    objetivo_acumulado = OBJETIVO_POS_VENTA_ACUMULADO
+    
     fig.add_shape(
         type="line",
         xref="paper", yref="y", # xref="paper" significa el ancho completo del gráfico
-        x0=0, y0=OBJETIVO_POS_VENTA,
-        x1=1, y1=OBJETIVO_POS_VENTA,
+        x0=0, y0=objetivo_acumulado,
+        x1=1, y1=objetivo_acumulado,
         line=dict(color="#fd7e14", width=2, dash="dot"),
-        name="Objetivo 50"
+        name="Objetivo Acumulado"
     )
     
     # Añadir anotación (texto) para la línea
     fig.add_annotation(
-        x=0.9, y=OBJETIVO_POS_VENTA,
-        text=f"Meta: {OBJETIVO_POS_VENTA}",
+        x=0.9, y=objetivo_acumulado,
+        text=f"Meta Acumulada: {objetivo_acumulado}",
         showarrow=False,
         yanchor="bottom",
         font=dict(color="#fd7e14", size=10)
