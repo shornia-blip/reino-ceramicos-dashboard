@@ -10,6 +10,7 @@ import requests
 import json      
 import os        
 import numpy as np 
+import io 
 
 # --- Constantes de Estilo y Colores ---
 COLOR_FONDO = "#222222" 
@@ -388,7 +389,7 @@ fig_horizontal_bar = create_horizontal_bar(conversion_whatsapp)
 
 # --- APP LAYOUT ---
 external_stylesheets = ['https://fonts.googleapis.com/css2?family=Open+Sans:wght@700&family=Arial&display=swap']
-app = dash.Dash(__name__, external_stylesheets=external_stylesheets)
+app = dash.Dash(__name__, external_stylesheets=external_stylesheets, suppress_callback_exceptions=True) # <--- CORRECCIÓN DE ERROR 1
 server = app.server
 
 # Componente para las tarjetas KPI
@@ -512,6 +513,9 @@ layout_contactos_detalle = html.Div(style={'backgroundColor': COLOR_FONDO, 'font
                    'border': 'none', 'borderRadius': KPI_BORDER_RADIUS, 'cursor': 'pointer',
                    'fontWeight': 'bold', 'marginBottom': '20px'}), href='/'),
                    
+    # Almacén de datos intermedio para la tabla (soluciona el error de Input non-existent)
+    dcc.Store(id='detalle-df-storage-raw', data=None), 
+                   
     html.Div(id='detalle-filters', style={'display': 'flex', 'justifyContent': 'flex-start', 'gap': '20px', 'marginBottom': '20px'}, children=[
         
         # Filtro por Estado
@@ -571,6 +575,39 @@ def display_page(pathname):
         return layout_contactos_detalle
     else:
         return layout_dashboard
+
+# CALLBACK INTERMEDIO: Transfiere y filtra los datos del día actual al store de detalle
+@app.callback(
+    Output('detalle-df-storage-raw', 'data'),
+    [Input('df-storage', 'data'),
+     Input('url', 'pathname')] # Asegura que se dispare cuando el layout cambia
+)
+def populate_detalle_store(data, pathname):
+    if pathname != '/detalle' or data is None:
+        # No estamos en la página de detalle o no hay datos cargados aún
+        return None 
+    
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    if df_mes_en_curso_callback.empty:
+        return None
+
+    # Filtro: Solo contactos del día de hoy
+    hoy_fecha = datetime.now().date()
+    df_hoy = df_mes_en_curso_callback[df_mes_en_curso_callback['created'].dt.date == hoy_fecha].copy()
+    
+    # 1. Identificar la última conversación por userId (para listar contactos únicos)
+    if 'userId' in df_hoy.columns and df_hoy['userId'].notna().any():
+        # Ordenar por fecha de creación descendente y mantener solo la primera ocurrencia de userId
+        df_detalle = df_hoy.sort_values('created', ascending=False).drop_duplicates(subset=['userId']).copy()
+        # Seleccionar las columnas requeridas (mapeando client.id a userId)
+        df_detalle = df_detalle[[
+            'id', 'created', 'assigned', 'attentionHour', 'status', 
+            'direction', 'answerTime', 'agent.name', 'userId', 'client.name', 'note', 'PuntoDeVenta'
+        ]].rename(columns={'userId': 'client.id'}).copy()
+    else:
+        df_detalle = pd.DataFrame(columns=['id', 'created', 'assigned', 'attentionHour', 'status', 'direction', 'answerTime', 'agent.name', 'client.id', 'client.name', 'note', 'PuntoDeVenta'])
+
+    return df_detalle.to_json(date_format='iso', orient='split') if not df_detalle.empty else None
 
 # CALLBACK DE RECARGA DE DATOS (Dashboard)
 @app.callback(
@@ -636,8 +673,13 @@ def parse_df_from_store(data):
     if data is None:
         return pd.DataFrame()
     try:
+        # CORRECCIÓN: Usar io.StringIO para evitar FutureWarning
+        # Asegurarse de que el input sea una cadena antes de envolver
+        json_str = data if isinstance(data, str) else json.dumps(data)
+        
         # Intenta leer el DF y convertir las columnas de fecha
-        df = pd.read_json(data, orient='split')
+        df = pd.read_json(io.StringIO(json_str), orient='split')
+        
         # Asegurarse de que las columnas de fecha sean datetime objects
         df['created'] = pd.to_datetime(df['created'], errors='coerce')
         if 'assigned_dt' in df.columns:
@@ -758,7 +800,6 @@ def update_graph_dia_semana(order_type, data):
         for i, day in enumerate(ORDEN_DIAS):
             objetivo = OBJETIVO_SEMANAL.get(day, 0) # Obtiene el objetivo o 0 si no existe
             shapes.append(
-                # Dibujar la línea sobre cada barra del gráfico
                 go.layout.Shape(
                     type="line",
                     xref="x", yref="y",
@@ -951,7 +992,7 @@ def update_graph_agente(data):
     df_mes_en_curso_callback = parse_df_from_store(data)
     if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Agente")))
     
-    d = df_mes_en_curso_callback.groupby('agent.name').size().reset_index(name='conteo')
+    d = df_mes_en_curso_callback.groupby('agent.name').size().reset_index(name='conteo') # CORRECCIÓN APLICADA
     d = d[d['conteo'] > 0] 
     d = d.sort_values('conteo', ascending=False).head(15) # Limitar a los 15 principales para visibilidad
     
@@ -970,42 +1011,29 @@ def update_graph_agente(data):
      Output('tabla-detalle', 'data'),
      Output('dropdown-status-filter', 'options'),
      Output('dropdown-pv-filter', 'options')],
-    [Input('df-storage', 'data'),
-     Input('dropdown-status-filter', 'value'),
-     Input('dropdown-pv-filter', 'value')]
+    [Input('dropdown-status-filter', 'value'),
+     Input('dropdown-pv-filter', 'value')],
+    [State('detalle-df-storage-raw', 'data')] # <--- CORRECCIÓN CLAVE: Leer los datos desde State
 )
-def update_detalle_table(data, selected_status, selected_pv):
-    # Usamos el DataFrame completo cargado por el intervalo
-    df_mes_en_curso_callback = parse_df_from_store(data)
+def update_detalle_table(selected_status, selected_pv, data):
+    # Usamos el DataFrame filtrado (solo contactos únicos de hoy)
+    # Se parsea el State que contiene el JSON del día actual
+    df_detalle = parse_df_from_store(data)
     
-    if df_mes_en_curso_callback.empty:
+    # Si el store está vacío (aún no se carga la data), retornar vacío.
+    if df_detalle.empty:
         return ([], [], [], [])
         
-    # Filtro: Solo contactos del día de hoy
-    hoy_fecha = datetime.now().date()
-    df_hoy = df_mes_en_curso_callback[df_mes_en_curso_callback['created'].dt.date == hoy_fecha].copy()
     
-    # 1. Identificar la última conversación por userId (para listar contactos únicos)
-    if 'userId' in df_hoy.columns:
-        # Ordenar por fecha de creación descendente y mantener solo la primera ocurrencia de userId
-        df_detalle = df_hoy.sort_values('created', ascending=False).drop_duplicates(subset=['userId'])
-        # Seleccionar las columnas requeridas (mapeando client.id a userId)
-        df_detalle = df_detalle[[
-            'id', 'created', 'assigned', 'attentionHour', 'status', 
-            'direction', 'answerTime', 'agent.name', 'userId', 'client.name', 'note', 'PuntoDeVenta'
-        ]].rename(columns={'userId': 'client.id'}).copy()
-    else:
-        df_detalle = pd.DataFrame(columns=['id', 'created', 'assigned', 'attentionHour', 'status', 'direction', 'answerTime', 'agent.name', 'client.id', 'client.name', 'note', 'PuntoDeVenta'])
-
-
-    # 2. Generar Opciones de Dropdown
+    # 1. Generar Opciones de Dropdown (siempre basadas en el DF completo del día)
     status_options = [{'label': s, 'value': s} for s in df_detalle['status'].dropna().unique()]
     pv_options = [{'label': pv, 'value': pv} for pv in df_detalle['PuntoDeVenta'].dropna().unique()]
     
     
-    # 3. Aplicar Filtros Interactivos (Status y PV)
+    # 2. Aplicar Filtros Interactivos (Status y PV)
     df_filtrado = df_detalle.copy()
     
+    # Nota: Los filtros se aplican solo a la vista actual, sin modificar las opciones disponibles
     if selected_status:
         df_filtrado = df_filtrado[df_filtrado['status'] == selected_status]
         
@@ -1013,7 +1041,7 @@ def update_detalle_table(data, selected_status, selected_pv):
         df_filtrado = df_filtrado[df_filtrado['PuntoDeVenta'] == selected_pv]
 
 
-    # 4. Configurar Columnas de la Tabla
+    # 3. Configurar Columnas de la Tabla
     column_names = {
         'id': 'ID Conversación',
         'created': 'F. Creación',
@@ -1029,12 +1057,13 @@ def update_detalle_table(data, selected_status, selected_pv):
     }
     
     # Crear la estructura de columnas para dash_table.DataTable
+    # La lista de columnas se basa en el DF completo del día (`df_detalle`) para garantizar que la estructura sea estable.
     columns = [{"name": column_names.get(col, col), "id": col, "type": "datetime"}
                if col in ['created', 'assigned'] else 
                {"name": column_names.get(col, col), "id": col}
-               for col in df_detalle.columns if col != 'PuntoDeVenta'] # Ocultamos PV, ya que se puede filtrar por él.
+               for col in df_detalle.columns if col != 'PuntoDeVenta'] 
 
-    # 5. Formatear y preparar datos para la tabla
+    # 4. Formatear y preparar datos para la tabla
     data_table = df_filtrado.to_dict('records')
     
     return (columns, data_table, status_options, pv_options)
