@@ -3,7 +3,7 @@ from dash import dcc, html
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
-from dash.dependencies import Input, Output
+from dash.dependencies import Input, Output, State
 from datetime import datetime, timedelta
 import re 
 import requests 
@@ -43,7 +43,6 @@ OBJETIVO_DIARIO_POR_PV = {
     'Saturday': 25, # Sábados: 25
     'Sunday': 10  # Domingos: 10
 }
-OBJETIVO_POS_VENTA = 50 # Se mantiene como fallback, pero será sobreescrito por el cálculo acumulado.
 META_CONVERSION_WHATSAPP = 50 # Objetivo para la barra horizontal
 
 # Requisito 2: Conversaciones por Día de la Semana (Valores variables)
@@ -185,8 +184,17 @@ def procesar_dataframe(raw_data):
         df['PuntoDeVenta'] = 'N/A'
         df['NombreAgenteLimpio'] = 'N/A'
 
+    # 5. Extracción de ID de usuario para contactos únicos
+    if 'user' in df.columns:
+        def get_user_id(x):
+            if isinstance(x, dict): return x.get('id', None)
+            return None
+        df['userId'] = df['user'].apply(get_user_id)
+    else:
+        df['userId'] = None
 
-    # 5. Filtro por Mes en Curso
+
+    # 6. Filtro por Mes en Curso
     hoy = datetime.now()
     inicio_mes = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     df_filtrado = df[df['created'] >= inicio_mes].copy()
@@ -197,45 +205,103 @@ def procesar_dataframe(raw_data):
     return df_filtrado
 
 # --- BLOQUE PRINCIPAL DE CARGA DE DATOS ---
-print("--- INICIANDO CARGA DE DATOS ---")
-if HIBOT_APP_ID and HIBOT_APP_SECRET:
-    print("Modo detectado: PRODUCCIÓN (API)")
-    token = get_auth_token()
-    raw_data = fetch_live_data(token)
-else:
-    print("Modo detectado: DESARROLLO LOCAL (Archivo JSON)")
-    raw_data = cargar_datos_locales()
-
-df_mes_en_curso = procesar_dataframe(raw_data)
-print(f"Conversaciones procesadas para el mes: {len(df_mes_en_curso)}")
-print("--------------------------------")
-
-# --- CÁLCULO DE OBJETIVO ACUMULADO POR PUNTO DE VENTA ---
 def calcular_objetivo_pos_venta_acumulado(hoy):
     """ Calcula el objetivo acumulado para un Punto de Venta hasta la fecha actual. """
     inicio_mes = hoy.replace(day=1).date()
     objetivo_acumulado = 0
     
-    # Recorrer todos los días desde el inicio del mes hasta hoy
     current_date = inicio_mes
     while current_date <= hoy.date():
-        # Obtener el nombre del día en inglés (ej: 'Monday')
         day_name = current_date.strftime('%A')
-        
-        # Sumar el objetivo diario para ese día
         objetivo_acumulado += OBJETIVO_DIARIO_POR_PV.get(day_name, 0)
-        
-        # Mover al siguiente día
         current_date += timedelta(days=1)
         
     return objetivo_acumulado
 
-# Calcular el objetivo acumulado utilizando el día actual
-OBJETIVO_POS_VENTA_ACUMULADO = calcular_objetivo_pos_venta_acumulado(datetime.now())
+def cargar_datos_y_calcular_kpis():
+    """ Función que encapsula la carga de datos y el cálculo de KPIs, para ser llamada por el intervalo. """
+    print("--- INICIANDO CARGA DE DATOS ---")
+    if HIBOT_APP_ID and HIBOT_APP_SECRET:
+        print("Modo detectado: PRODUCCIÓN (API)")
+        token = get_auth_token()
+        raw_data = fetch_live_data(token)
+    else:
+        print("Modo detectado: DESARROLLO LOCAL (Archivo JSON)")
+        raw_data = cargar_datos_locales()
 
-# --- CÁLCULO DE KPIS ---
+    df_mes_en_curso = procesar_dataframe(raw_data)
+    print(f"Conversaciones procesadas para el mes: {len(df_mes_en_curso)}")
+    print("--------------------------------")
+
+    OBJETIVO_POS_VENTA_ACUMULADO = calcular_objetivo_pos_venta_acumulado(datetime.now())
+
+    # --- CÁLCULO DE KPIS ---
+    total_conversaciones_mes = 0
+    total_conversaciones_hoy = 0
+    total_contactos_unicos_hoy = 0 
+    total_contactos_unicos_mes = 0 
+    total_venta = 0
+    total_venta_a_confirmar = 0
+    total_venta_perdida = 0
+    total_otro_motivo = 0
+    total_reclamo = 0
+    conversion_whatsapp = 0.0
+
+    if not df_mes_en_curso.empty:
+        hoy_fecha = datetime.now().date()
+        
+        # Conversaciones (Total rows)
+        total_conversaciones_mes = len(df_mes_en_curso)
+        df_hoy = df_mes_en_curso[df_mes_en_curso['created'].dt.date == hoy_fecha]
+        total_conversaciones_hoy = len(df_hoy)
+        
+        # Contactos Únicos (Unique user IDs)
+        if 'userId' in df_mes_en_curso.columns and df_mes_en_curso['userId'].any():
+            total_contactos_unicos_mes = df_mes_en_curso['userId'].nunique()
+            total_contactos_unicos_hoy = df_hoy['userId'].nunique()
+        
+        # Typing metrics
+        if 'typing' in df_mes_en_curso.columns:
+            total_venta = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA'])
+            total_venta_a_confirmar = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA A CONFIRMAR'])
+            total_venta_perdida = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA PERDIDA'])
+            total_otro_motivo = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'OTRO MOTIVO'])
+            total_reclamo = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'RECLAMO'])
+
+        # WhatsApp Conversion (CÁLCULO AJUSTADO a Contactos Únicos)
+        if 'channelType' in df_mes_en_curso.columns:
+            df_wp = df_mes_en_curso[df_mes_en_curso['channelType'] == 'WhatsApp']
+            
+            ventas_wp = len(df_wp[df_wp['typing'] == 'VENTA'])
+            contactos_unicos_wp = df_wp['userId'].nunique() if 'userId' in df_wp.columns else len(df_wp)
+            
+            if contactos_unicos_wp > 0:
+                conversion_whatsapp = (ventas_wp / contactos_unicos_wp) * 100
+            else:
+                conversion_whatsapp = 0.0
+    
+    return {
+        'df': df_mes_en_curso,
+        'conv_mes': total_conversaciones_mes,
+        'conv_hoy': total_conversaciones_hoy,
+        'contactos_mes': total_contactos_unicos_mes,
+        'contactos_hoy': total_contactos_unicos_hoy,
+        'venta': total_venta,
+        'venta_conf': total_venta_a_confirmar,
+        'venta_perdida': total_venta_perdida,
+        'otro_motivo': total_otro_motivo,
+        'reclamo': total_reclamo,
+        'conv_wp': conversion_whatsapp,
+        'meta_pv_acumulada': OBJETIVO_POS_VENTA_ACUMULADO
+    }
+
+# Variables globales iniciales vacías para el layout (se llenarán con el primer callback)
+df_mes_en_curso = pd.DataFrame()
+OBJETIVO_POS_VENTA_ACUMULADO = 0
 total_conversaciones_mes = 0
 total_conversaciones_hoy = 0
+total_contactos_unicos_mes = 0
+total_contactos_unicos_hoy = 0
 total_venta = 0
 total_venta_a_confirmar = 0
 total_venta_perdida = 0
@@ -243,23 +309,6 @@ total_otro_motivo = 0
 total_reclamo = 0
 conversion_whatsapp = 0.0
 
-if not df_mes_en_curso.empty:
-    hoy_fecha = datetime.now().date()
-    total_conversaciones_mes = len(df_mes_en_curso)
-    total_conversaciones_hoy = len(df_mes_en_curso[df_mes_en_curso['created'].dt.date == hoy_fecha])
-    
-    if 'typing' in df_mes_en_curso.columns:
-        total_venta = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA'])
-        total_venta_a_confirmar = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA A CONFIRMAR'])
-        total_venta_perdida = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'VENTA PERDIDA'])
-        total_otro_motivo = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'OTRO MOTIVO'])
-        total_reclamo = len(df_mes_en_curso[df_mes_en_curso['typing'] == 'RECLAMO'])
-
-    if 'channelType' in df_mes_en_curso.columns:
-        df_wp = df_mes_en_curso[df_mes_en_curso['channelType'] == 'WhatsApp']
-        if len(df_wp) > 0:
-            ventas_wp = len(df_wp[df_wp['typing'] == 'VENTA'])
-            conversion_whatsapp = (ventas_wp / len(df_wp)) * 100
 
 # --- CREACIÓN DE BARRA DE CUMPLIMIENTO HORIZONTAL (Requisito 8) ---
 def create_horizontal_bar(value):
@@ -287,7 +336,7 @@ def create_horizontal_bar(value):
     # Configuración de layout
     fig.update_layout(
         title={
-            'text': "% CONVERSIÓN WHATSAPP", 
+            'text': "% CONVERSIÓN WHATSAPP (Basado en Contactos Únicos)", 
             'y':0.95, 'x':0.5, 'xanchor': 'center', 'yanchor': 'top',
             'font': {'size': 18}
         },
@@ -355,40 +404,60 @@ def control_orden(id_sufix, titulo, opciones):
         )
     ], style={'padding': '10px', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'marginBottom': '20px'})
 
+# Control para el nuevo gráfico de Rendimiento
+def control_rendimiento_pos():
+    return html.Div([
+        html.H4("Visualizar Rendimiento por PV", style={'color': COLOR_TEXTO, 'fontSize': '16px', 'fontFamily': 'Open Sans', 'marginTop': '10px'}),
+        dcc.RadioItems(
+            id='radio-pos-rendimiento-display',
+            options=[
+                {'label': 'Ventas (Cantidad)', 'value': 'CANTIDAD'},
+                {'label': 'Conversión (%)', 'value': 'PORCENTAJE'}
+            ],
+            value='CANTIDAD', # Valor por defecto: Cantidad de Ventas
+            labelStyle={'display': 'inline-block', 'marginRight': '20px', 'color': COLOR_TEXTO}
+        )
+    ], style={'padding': '10px', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'marginBottom': '20px'})
+
 
 app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Arial', 'padding': '20px', 'minHeight': '100vh'}, children=[
     
+    # Componente oculto para recargar datos en el cliente
+    dcc.Interval(
+        id='interval-component',
+        interval=30*60*1000, # 30 minutos en milisegundos
+        n_intervals=0
+    ),
+
     html.H1('Tablero de control Digital - Reino Cerámicos', 
             style={'textAlign': 'center', 'color': COLOR_TEXTO, 'fontFamily': 'Open Sans', 'fontWeight': 'bold', 'marginBottom': '5px'}),
-    html.P(f"Datos actualizados al: {datetime.now().strftime('%d/%m/%Y %H:%M')}", 
+    # La fecha de actualización ahora se actualiza vía callback
+    html.P(id='live-update-time', 
            style={'textAlign': 'center', 'color': '#aaaaaa', 'marginTop': '0'}),
 
-    # Fila 1 de KPIs (Requisito 1, 2, 3, 4)
-    html.Div(style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[
-        # 1. TOTALES HOY
-        tarjeta_kpi('Conversaciones Hoy', total_conversaciones_hoy, '#17a2b8', ancho='19%'),
-        # 2. TOTALES MES
-        tarjeta_kpi('Conversaciones Acumuladas', total_conversaciones_mes, '#007bff', ancho='19%'),
-        # 3. VENTA
-        tarjeta_kpi('Ventas', total_venta, '#28a745', ancho='19%'),
-        # 4. VENTA A CONFIRMAR
-        tarjeta_kpi('Ventas a Confirmar', total_venta_a_confirmar, '#ffc107', ancho='19%'),
+    # Fila 1 de KPIs: Conversaciones y Contactos Únicos (4 tarjetas)
+    html.Div(id='kpi-row-1', style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[
+        # Inicialmente vacío o con datos base
+        tarjeta_kpi('Conversaciones Hoy', total_conversaciones_hoy, '#17a2b8', ancho='20%'),
+        tarjeta_kpi('Conversaciones Acumuladas', total_conversaciones_mes, '#007bff', ancho='20%'),
+        tarjeta_kpi('Contactos Únicos Hoy', total_contactos_unicos_hoy, '#00C4CC', ancho='20%'),
+        tarjeta_kpi('Contactos Únicos Acumulados', total_contactos_unicos_mes, '#8000FF', ancho='20%'),
     ]),    
     
-    # Fila 2 de KPIs (Requisito 5, 6, 7 y la nueva barra)
-    html.Div(style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[
-        # 5. VENTA PERDIDA
-        tarjeta_kpi('Ventas Perdidas', total_venta_perdida, '#dc3545', ancho='27%'),
-        # 6. OTRO MOTIVO
-        tarjeta_kpi('Otro Motivo', total_otro_motivo, '#adb5bd', ancho='27%'),
-        # 7. RECLAMO
-        tarjeta_kpi('Reclamos', total_reclamo, '#fd7e14', ancho='27%'),
+    # Fila 2 de KPIs: Ventas y Clasificaciones (5 tarjetas)
+    html.Div(id='kpi-row-2', style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[
+        # Inicialmente vacío o con datos base
+        tarjeta_kpi('Ventas', total_venta, '#28a745', ancho='15%'),
+        tarjeta_kpi('Ventas a Confirmar', total_venta_a_confirmar, '#ffc107', ancho='15%'),
+        tarjeta_kpi('Ventas Perdidas', total_venta_perdida, '#dc3545', ancho='15%'),
+        tarjeta_kpi('Otro Motivo', total_otro_motivo, '#adb5bd', ancho='15%'),
+        tarjeta_kpi('Reclamos', total_reclamo, '#fd7e14', ancho='15%'),
     ]),
 
     # Fila 3 ahora solo contiene la barra horizontal de Conversión de WhatsApp
-    html.Div(style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[    
-        # 8. CONVERSIÓN WHATSAPP (Barra de Cumplimiento Horizontal)
-        html.Div(dcc.Graph(figure=fig_horizontal_bar, config={'displayModeBar': False}), 
+    html.Div(id='kpi-row-3', style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[    
+        # 10. CONVERSIÓN WHATSAPP (Barra de Cumplimiento Horizontal)
+        html.Div(dcc.Graph(id='graph-conversion-wp', figure=fig_horizontal_bar, config={'displayModeBar': False}), 
                  style={'width': '90%', 'height': '100px', 'margin': '1%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '5px'}),
     ]),
 
@@ -403,6 +472,17 @@ app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Aria
         # Control para Hora Asignación
         control_orden('hora-asignacion-order', 'Visualizar hora de asignación de:', {'9 - 18hs': 'FIJO', 'Mayor a Menor': 'DESC'}),
     ]),
+    
+    # Nuevo Control para Rendimiento PV
+    html.Div(style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap', 'margin': '10px 0'}, children=[
+        control_rendimiento_pos()
+    ]),
+    
+    # Contenedor para almacenar el DF en memoria para los callbacks
+    # Se inicializan vacíos o con datos base. El callback de intervalo los llenará.
+    dcc.Store(id='df-storage', data=None), 
+    dcc.Store(id='meta-pv-storage', data=OBJETIVO_POS_VENTA_ACUMULADO),
+
 
     # Gráficos de Contenido (Full Width / Half Width)
     html.Div(style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'center'}, children=[
@@ -411,7 +491,8 @@ app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Aria
         dcc.Graph(id='graph-dia-semana', style={'width': '48%', 'margin': '10px'}), 
         dcc.Graph(id='graph-hora-creacion', style={'width': '48%', 'margin': '10px'}), 
         dcc.Graph(id='graph-hora-asignacion', style={'width': '48%', 'margin': '10px'}), 
-        dcc.Graph(id='graph-pos-bar', style={'width': '48%', 'margin': '10px'}), 
+        # Gráfico ÚNICO de Rendimiento de Punto de Venta (Interactivo)
+        dcc.Graph(id='graph-pos-rendimiento', style={'width': '48%', 'margin': '10px'}), 
         dcc.Graph(id='graph-agente-bar', style={'width': '48%', 'margin': '10px'}),
     ])
 ])
@@ -419,6 +500,56 @@ app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Aria
 # -------------------------------------------------------------------
 # LÓGICA INTERACTIVA (CALLBACKS DE DASH)
 # -------------------------------------------------------------------
+
+# CALLBACK PRINCIPAL DE RECARGA DE DATOS (Se ejecuta en el cliente)
+@app.callback(
+    [Output('df-storage', 'data'),
+     Output('meta-pv-storage', 'data'),
+     Output('live-update-time', 'children'),
+     Output('kpi-row-1', 'children'),
+     Output('kpi-row-2', 'children'),
+     Output('graph-conversion-wp', 'figure')],
+    [Input('interval-component', 'n_intervals')]
+)
+def update_data_and_kpis(n):
+    # La lógica de carga de datos y cálculo de KPI se ejecuta aquí dentro.
+    
+    datos_actualizados = cargar_datos_y_calcular_kpis()
+    df_mes_en_curso_updated = datos_actualizados['df']
+    meta_pv_acumulada_updated = datos_actualizados['meta_pv_acumulada']
+    
+    # Reconstruir las filas KPI con los nuevos valores
+    kpi_row_1 = [
+        tarjeta_kpi('Conversaciones Hoy', datos_actualizados['conv_hoy'], '#17a2b8', ancho='20%'),
+        tarjeta_kpi('Conversaciones Acumuladas', datos_actualizados['conv_mes'], '#007bff', ancho='20%'),
+        tarjeta_kpi('Contactos Únicos Hoy', datos_actualizados['contactos_hoy'], '#00C4CC', ancho='20%'),
+        tarjeta_kpi('Contactos Únicos Acumulados', datos_actualizados['contactos_mes'], '#8000FF', ancho='20%'),
+    ]
+
+    kpi_row_2 = [
+        tarjeta_kpi('Ventas', datos_actualizados['venta'], '#28a745', ancho='15%'),
+        tarjeta_kpi('Ventas a Confirmar', datos_actualizados['venta_conf'], '#ffc107', ancho='15%'),
+        tarjeta_kpi('Ventas Perdidas', datos_actualizados['venta_perdida'], '#dc3545', ancho='15%'),
+        tarjeta_kpi('Otro Motivo', datos_actualizados['otro_motivo'], '#adb5bd', ancho='15%'),
+        tarjeta_kpi('Reclamos', datos_actualizados['reclamo'], '#fd7e14', ancho='15%'),
+    ]
+    
+    # Actualizar la barra de conversión de WhatsApp
+    fig_wp_updated = create_horizontal_bar(datos_actualizados['conv_wp'])
+    
+    # Actualizar la hora
+    time_str = f"Datos actualizados al: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    
+    # Devolver el DataFrame serializado y la meta para que otros Callbacks los usen.
+    return (
+        df_mes_en_curso_updated.to_json(date_format='iso', orient='split') if not df_mes_en_curso_updated.empty else None,
+        meta_pv_acumulada_updated,
+        time_str,
+        kpi_row_1,
+        kpi_row_2,
+        fig_wp_updated
+    )
+
 
 def aplicar_estilos_grafico(fig):
     """ Función auxiliar para aplicar el tema oscuro a un gráfico. """
@@ -431,29 +562,55 @@ def aplicar_estilos_grafico(fig):
     fig.update_traces(textfont_color=COLOR_TEXTO, textposition='outside')
     return fig
 
+# Función auxiliar para parsear el DF desde el Store
+def parse_df_from_store(data):
+    if data is None:
+        return pd.DataFrame()
+    try:
+        # Intenta leer el DF y convertir las columnas de fecha
+        df = pd.read_json(data, orient='split')
+        # Asegurarse de que las columnas de fecha sean datetime objects
+        df['created'] = pd.to_datetime(df['created'], errors='coerce')
+        if 'assigned_dt' in df.columns:
+            df['assigned_dt'] = pd.to_datetime(df['assigned_dt'], errors='coerce')
+        return df
+    except Exception as e:
+        print(f"Error al parsear DataFrame desde el Store: {e}")
+        return pd.DataFrame()
+
 
 # CALLBACK para Gráfico Diario (Requisito 9)
 @app.callback(
     Output('graph-diaria-mes', 'figure'),
-    [Input('graph-diaria-mes', 'id')] 
+    [Input('df-storage', 'data')] 
 )
-def update_graph_diaria(_):
+def update_graph_diaria(data):
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    
     # Si no hay datos, devolvemos una figura vacía con el estilo.
-    if df_mes_en_curso.empty: 
+    if df_mes_en_curso_callback.empty: 
         return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos para el Mes")))
     
     # --- 1. Crear el rango completo de días del mes ---
+    # Usar la fecha máxima/mínima del DF si está disponible, sino usar hoy/inicio de mes
     hoy = datetime.now()
-    inicio_mes = hoy.replace(day=1).date()
+    if not df_mes_en_curso_callback.empty:
+        # Aseguramos que la columna 'created' es datetime antes de usar .min()
+        min_date_raw = df_mes_en_curso_callback['created'].min()
+        inicio_mes = min_date_raw.date() if pd.notna(min_date_raw) else hoy.replace(day=1).date()
+    else:
+        inicio_mes = hoy.replace(day=1).date()
+
     
-    # Crear lista de fechas desde el 1 hasta hoy
+    # Crear lista de fechas desde el inicio del mes hasta hoy
     dates = [inicio_mes + timedelta(days=i) for i in range((hoy.date() - inicio_mes).days + 1)]
     dates_str = [d.strftime('%d-%m') for d in dates]
     
     df_full_month = pd.DataFrame({'dia_mes_str': dates_str})
     
     # 2. Agrupación y cuenta de datos reales
-    d_real = df_mes_en_curso.groupby('dia_mes_str').size().reset_index(name='conteo')
+    # Contar conversaciones (total rows)
+    d_real = df_mes_en_curso_callback.groupby('dia_mes_str').size().reset_index(name='conteo')
     
     # 3. Unir los datos reales con el rango completo y rellenar con 0
     d = df_full_month.merge(d_real, on='dia_mes_str', how='left').fillna(0)
@@ -468,16 +625,13 @@ def update_graph_diaria(_):
                  text_auto=True,
                  category_orders={'dia_mes_str': dates_str}) # Esto asegura el orden correcto
     
-    # **INICIO DE LA CORRECCIÓN**
+    # Corregir la visualización del eje X a Categoría
     fig.update_xaxes(
         title_text="Fecha (Día-Mes)",
-        # Forzar el tipo de eje a 'category' para evitar que Plotly lo interprete como tiempo
         type='category', 
-        # Asegurarse de que el orden de las categorías sea el que acabamos de crear (dates_str)
         categoryorder='array',
         categoryarray=dates_str
     )
-    # **FIN DE LA CORRECCIÓN**
 
     return aplicar_estilos_grafico(fig)
 
@@ -485,12 +639,14 @@ def update_graph_diaria(_):
 # CALLBACK para Participación por Canal (Torta/Pie) (Requisito 10)
 @app.callback(
     Output('graph-canal-torta', 'figure'),
-    [Input('radio-canal-display', 'value')]
+    [Input('radio-canal-display', 'value'),
+     Input('df-storage', 'data')]
 )
-def update_graph_canal(display_type):
-    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Canal")))
+def update_graph_canal(display_type, data):
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Canal")))
 
-    d = df_mes_en_curso.groupby('channelType').size().reset_index(name='conteo')
+    d = df_mes_en_curso_callback.groupby('channelType').size().reset_index(name='conteo')
     
     if display_type == 'COUNT':
         fig = px.pie(d, names='channelType', values='conteo', 
@@ -511,13 +667,15 @@ def update_graph_canal(display_type):
 # CALLBACK para Día de la Semana (Barras) (Requisito 11)
 @app.callback(
     Output('graph-dia-semana', 'figure'),
-    [Input('radio-dia-semana-order', 'value')]
+    [Input('radio-dia-semana-order', 'value'),
+     Input('df-storage', 'data')]
 )
-def update_graph_dia_semana(order_type):
+def update_graph_dia_semana(order_type, data):
+    df_mes_en_curso_callback = parse_df_from_store(data)
     # Si no hay datos, devolvemos una figura vacía con el estilo.
-    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Día de Semana")))
+    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Día de Semana")))
     
-    d = df_mes_en_curso.groupby('dia_semana').size().reset_index(name='conteo')
+    d = df_mes_en_curso_callback.groupby('dia_semana').size().reset_index(name='conteo')
     shapes = [] # Para las líneas guía
 
     if order_type == 'FIJO':
@@ -567,13 +725,15 @@ def update_graph_dia_semana(order_type):
 # CALLBACK para Hora de Creación (Requisito 12)
 @app.callback(
     Output('graph-hora-creacion', 'figure'),
-    [Input('radio-hora-creacion-order', 'value')]
+    [Input('radio-hora-creacion-order', 'value'),
+     Input('df-storage', 'data')]
 )
-def update_graph_hora_creacion(order_type):
-    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Hora de Creación")))
+def update_graph_hora_creacion(order_type, data):
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Hora de Creación")))
     
     all_hours = pd.DataFrame({'hora_inicio': range(24)})
-    d = df_mes_en_curso.groupby('hora_inicio').size().reset_index(name='conteo')
+    d = df_mes_en_curso_callback.groupby('hora_inicio').size().reset_index(name='conteo')
     d = all_hours.merge(d, on='hora_inicio', how='left').fillna(0) # Rellenar horas sin datos con 0
 
     if order_type == 'FIJO':
@@ -595,13 +755,15 @@ def update_graph_hora_creacion(order_type):
 # CALLBACK para Hora de Asignación (Requisito 13)
 @app.callback(
     Output('graph-hora-asignacion', 'figure'),
-    [Input('radio-hora-asignacion-order', 'value')]
+    [Input('radio-hora-asignacion-order', 'value'),
+     Input('df-storage', 'data')]
 )
-def update_graph_hora_asignacion(order_type):
-    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Hora de Asignación")))
+def update_graph_hora_asignacion(order_type, data):
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Hora de Asignación")))
     
     # Rango 9 a 18 (incluyendo 9 y 18)
-    d_fil = df_mes_en_curso[(df_mes_en_curso['hora_asignacion'] >= 9) & (df_mes_en_curso['hora_asignacion'] <= 18)].copy()
+    d_fil = df_mes_en_curso_callback[(df_mes_en_curso_callback['hora_asignacion'] >= 9) & (df_mes_en_curso_callback['hora_asignacion'] <= 18)].copy()
     
     all_hours = pd.DataFrame({'hora_asignacion': range(9, 19)})
     d = d_fil.groupby('hora_asignacion').size().reset_index(name='conteo')
@@ -623,58 +785,102 @@ def update_graph_hora_asignacion(order_type):
     return aplicar_estilos_grafico(fig)
 
 
-# CALLBACK para Punto de Venta (Barras) (Ordenado por defecto)
+# CALLBACK para Rendimiento por Punto de Venta (NUEVO GRÁFICO INTERACTIVO)
 @app.callback(
-    Output('graph-pos-bar', 'figure'),
-    [Input('radio-dia-semana-order', 'id')] 
+    Output('graph-pos-rendimiento', 'figure'),
+    [Input('radio-pos-rendimiento-display', 'value'),
+     Input('df-storage', 'data'),
+     Input('meta-pv-storage', 'data')]
 )
-def update_graph_pos(_):
-    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Punto de Venta")))
+def update_graph_pos_rendimiento(display_type, data, objetivo_acumulado):
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Rendimiento por Punto de Venta")))
     
-    d = df_mes_en_curso.groupby('PuntoDeVenta').size().reset_index(name='conteo')
-    d = d.sort_values('conteo', ascending=False)
+    # Crear una lista única de todos los Puntos de Venta (PV) para asegurar la visibilidad de los PV con cero ventas
+    todos_los_pv = df_mes_en_curso_callback['PuntoDeVenta'].unique()
+    df_base = pd.DataFrame({'PuntoDeVenta': todos_los_pv})
     
-    fig = px.bar(d, x='PuntoDeVenta', y='conteo', 
-                 title="Conversaciones por Punto de Venta (Mes)",
-                 color_discrete_sequence=[COLOR_BARRA_AZUL],
-                 text_auto=True)
+    if display_type == 'CANTIDAD':
+        # --- MODO 1: Cantidad de Ventas (Typing='VENTA') ---
+        d_sales = df_mes_en_curso_callback[df_mes_en_curso_callback['typing'] == 'VENTA'].groupby('PuntoDeVenta').size().reset_index(name='Ventas')
+        
+        # Unir con la base de PV y rellenar nulos con 0
+        d_final = df_base.merge(d_sales, on='PuntoDeVenta', how='left').fillna(0)
+        d_final['Ventas'] = d_final['Ventas'].astype(int)
+        
+        # Ordenar de Mayor a Menor Cantidad de Ventas
+        d_final = d_final.sort_values('Ventas', ascending=False)
+
+        fig = px.bar(d_final, x='PuntoDeVenta', y='Ventas', 
+                     title="Ventas (Cantidad) por Punto de Venta (Mes)",
+                     color_discrete_sequence=[COLOR_BARRA_AZUL],
+                     text_auto=True)
+        
+        fig.update_yaxes(title_text="Ventas (Unidades)")
+        
+        # Lógica de la Línea Guía (Objetivo Acumulado) - Se aplica solo a la Cantidad
+        
+        fig.add_shape(
+            type="line",
+            xref="paper", yref="y",
+            x0=0, y0=objetivo_acumulado,
+            x1=1, y1=objetivo_acumulado,
+            line=dict(color="#fd7e14", width=2, dash="dot"),
+            name="Objetivo Acumulado"
+        )
+        fig.add_annotation(
+            x=0.9, y=objetivo_acumulado,
+            text=f"Meta Acumulada: {objetivo_acumulado}",
+            showarrow=False,
+            yanchor="bottom",
+            font=dict(color="#fd7e14", size=10)
+        )
+
+    else:
+        # --- MODO 2: Porcentaje de Conversión sobre Contactos Únicos ---
+        
+        # 1. Contar Ventas por PV
+        df_ventas = df_mes_en_curso_callback[df_mes_en_curso_callback['typing'] == 'VENTA'].groupby('PuntoDeVenta')['userId'].size().reset_index(name='Ventas')
+        
+        # 2. Contar Contactos Únicos por PV
+        df_contacts = df_mes_en_curso_callback.groupby('PuntoDeVenta')['userId'].nunique().reset_index(name='Contactos_Unicos')
+        
+        # 3. Unir Ventas y Contactos
+        d_calc = df_base.merge(df_ventas, on='PuntoDeVenta', how='left').fillna(0)
+        d_calc = d_calc.merge(df_contacts, on='PuntoDeVenta', how='left').fillna(0)
+        
+        # Calcular Porcentaje de Conversión
+        d_calc['Conversion'] = np.where(
+            d_calc['Contactos_Unicos'] > 0,
+            (d_calc['Ventas'] / d_calc['Contactos_Unicos']) * 100,
+            0
+        )
+        
+        # Ordenar de Mayor a Menor Porcentaje de Conversión
+        d_calc = d_calc.sort_values('Conversion', ascending=False)
+        
+        fig = px.bar(d_calc, x='PuntoDeVenta', y='Conversion', 
+                     title="Conversión (%) por PV (Ventas / Contactos Únicos)",
+                     color_discrete_sequence=[COLOR_BARRA_AZUL],
+                     text_auto='.2f') # Mostrar dos decimales para porcentaje
+
+        fig.update_yaxes(title_text="Conversión (%)", range=[0, d_calc['Conversion'].max() * 1.1])
     
+    # Ajustes finales del gráfico
     fig.update_xaxes(title_text="Punto de Venta")
-    
-    # --- Lógica de la Línea Guía (Objetivo Acumulado) ---
-    # Usamos OBJETIVO_POS_VENTA_ACUMULADO para la línea.
-    objetivo_acumulado = OBJETIVO_POS_VENTA_ACUMULADO
-    
-    fig.add_shape(
-        type="line",
-        xref="paper", yref="y", # xref="paper" significa el ancho completo del gráfico
-        x0=0, y0=objetivo_acumulado,
-        x1=1, y1=objetivo_acumulado,
-        line=dict(color="#fd7e14", width=2, dash="dot"),
-        name="Objetivo Acumulado"
-    )
-    
-    # Añadir anotación (texto) para la línea
-    fig.add_annotation(
-        x=0.9, y=objetivo_acumulado,
-        text=f"Meta Acumulada: {objetivo_acumulado}",
-        showarrow=False,
-        yanchor="bottom",
-        font=dict(color="#fd7e14", size=10)
-    )
-    
     return aplicar_estilos_grafico(fig)
 
 
 # CALLBACK para Agente (Barras) (Ordenado por defecto)
 @app.callback(
     Output('graph-agente-bar', 'figure'),
-    [Input('radio-dia-semana-order', 'id')] 
+    [Input('df-storage', 'data')] 
 )
-def update_graph_agente(_):
-    if df_mes_en_curso.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Agente")))
+def update_graph_agente(data):
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Agente")))
     
-    d = df_mes_en_curso.groupby('NombreAgenteLimpio').size().reset_index(name='conteo')
+    d = df_mes_en_curso_callback.groupby('NombreAgenteLimpio').size().reset_index(name='conteo')
     d = d[d['conteo'] > 0] 
     d = d.sort_values('conteo', ascending=False).head(15) # Limitar a los 15 principales para visibilidad
     
