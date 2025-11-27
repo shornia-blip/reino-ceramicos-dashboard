@@ -30,6 +30,13 @@ CANAL_COLORS = {
     'N/A': 'gray'
 }
 
+# Colores para Dirección (IN/OUT)
+DIRECTION_COLORS = {
+    'IN': '#4CAF50', # Verde
+    'OUT': '#FF9800', # Naranja
+    'N/A': '#757575'
+}
+
 # Orden fijo de días de la semana (Requisito 11)
 ORDEN_DIAS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 NOMBRES_DIAS_ES = {
@@ -67,7 +74,7 @@ def get_auth_token():
     try:
         login_url = f"{HIBOT_BASE_URL}/login"
         payload = {"appId": HIBOT_APP_ID, "appSecret": HIBOT_APP_SECRET}
-        print(f"Solicitando token a API...")
+        print("Solicitando token a API...")
         response = requests.post(login_url, json=payload, timeout=10)
         response.raise_for_status() 
         return response.json().get("token")
@@ -135,7 +142,8 @@ def procesar_dataframe(raw_data):
 
     if 'assigned' in df.columns:
         df['assigned_dt'] = pd.to_datetime(df['assigned'], errors='coerce', unit='ms')
-        df['assigned_dt'] = df['assigned_dt'].dt.tz_localize(None)
+        # CORRECCIÓN DE ASIGNACIÓN: Asegurar que la columna assigned_dt sea timezone-naive
+        df['assigned_dt'] = df['assigned_dt'].dt.tz_localize(None) 
         # Columna clave para el gráfico de asignación por hora
         df['hora_asignacion'] = df['assigned_dt'].dt.hour 
     else:
@@ -154,7 +162,6 @@ def procesar_dataframe(raw_data):
     if 'agent' in df.columns:
         def get_agent_name(x):
             if isinstance(x, dict): 
-                # Nuevo campo: nombre completo del agente (para la tabla detalle)
                 return x.get('name', 'Sin Agente')
             return 'N/A'
         
@@ -194,10 +201,11 @@ def procesar_dataframe(raw_data):
         df['client.name'] = None
     
     # 6. Extracción de otros campos para la tabla detalle (Punto 4)
+    # Se mantienen estas extracciones simples para no romper la estructura de las otras métricas
     df['id'] = df.get('id', pd.Series(dtype='object'))
-    df['attentionHour'] = df.get('attentionHour', pd.Series(dtype='object')) # Asumo que attentionHour está en el JSON si existe
-    df['status'] = df.get('status', 'N/A') # Estado de la conversación
-    df['direction'] = df.get('direction', 'N/A')
+    df['attentionHour'] = df.get('attentionHour', pd.Series(dtype='object')) 
+    df['status'] = df.get('status', 'N/A') 
+    df['direction'] = df.get('direction', 'N/A') # Campo que usaremos para IN/OUT
     df['answerTime'] = df.get('answerTime', pd.Series(dtype='object'))
     df['note'] = df.get('note', pd.Series(dtype='object'))
     df['assigned'] = df.get('assigned', pd.Series(dtype='object')) # Raw timestamp para la tabla
@@ -229,19 +237,37 @@ def calcular_objetivo_pos_venta_acumulado(hoy):
 def cargar_datos_y_calcular_kpis():
     """ Función que encapsula la carga de datos y el cálculo de KPIs, para ser llamada por el intervalo. """
     print("--- INICIANDO CARGA DE DATOS ---")
-    if HIBOT_APP_ID and HIBOT_APP_SECRET:
+    
+    # Bandera para saber si estamos en modo local
+    is_local_mode = not (HIBOT_APP_ID and HIBOT_APP_SECRET)
+
+    if is_local_mode:
+        print("Modo detectado: DESARROLLO LOCAL (Archivo JSON)")
+        raw_data = cargar_datos_locales()
+    else:
         print("Modo detectado: PRODUCCIÓN (API)")
         token = get_auth_token()
         raw_data = fetch_live_data(token)
-    else:
-        print("Modo detectado: DESARROLLO LOCAL (Archivo JSON)")
-        raw_data = cargar_datos_locales()
 
     df_mes_en_curso = procesar_dataframe(raw_data)
     print(f"Conversaciones procesadas para el mes: {len(df_mes_en_curso)}")
     print("--------------------------------")
-
+    
+    # --- DETERMINAR HOY_FECHA (Corrección para prueba local) ---
+    if is_local_mode and not df_mes_en_curso.empty and 'created' in df_mes_en_curso.columns:
+        # Si estamos en modo local y hay datos, simulamos que 'hoy' es la última fecha del DF.
+        hoy_dt = df_mes_en_curso['created'].max()
+        hoy_fecha = hoy_dt.date()
+        print(f"Simulando hoy como la fecha de datos más reciente: {hoy_fecha.strftime('%d/%m/%Y')}")
+    else:
+        # En modo producción o si no hay datos, usamos la fecha actual del sistema.
+        hoy_dt = datetime.now()
+        hoy_fecha = hoy_dt.date()
+    
+    # La meta acumulada SIEMPRE debe calcularse en base a la fecha real de HOY, 
+    # ya que es un KPI de rendimiento diario que no debe simularse.
     OBJETIVO_POS_VENTA_ACUMULADO = calcular_objetivo_pos_venta_acumulado(datetime.now())
+
 
     # --- CÁLCULO DE KPIS ---
     total_conversaciones_mes = 0
@@ -254,17 +280,28 @@ def cargar_datos_y_calcular_kpis():
     total_otro_motivo = 0
     total_reclamo = 0
     conversion_whatsapp = 0.0
-
+    
+    # NUEVOS KPIS DE DIRECCIÓN (Punto 1)
+    in_hoy = 0
+    out_hoy = 0
+    in_mes = 0
+    out_mes = 0
+    
     if not df_mes_en_curso.empty:
-        hoy_fecha = datetime.now().date()
         
         # Conversaciones (Total rows)
         total_conversaciones_mes = len(df_mes_en_curso)
+        # Usamos la HOY_FECHA simulada o real para el filtro 'HOY'
         df_hoy = df_mes_en_curso[df_mes_en_curso['created'].dt.date == hoy_fecha]
         total_conversaciones_hoy = len(df_hoy)
         
+        # Conteo IN/OUT (Punto 1)
+        in_hoy = len(df_hoy[df_hoy['direction'] == 'IN'])
+        out_hoy = len(df_hoy[df_hoy['direction'] == 'OUT'])
+        in_mes = len(df_mes_en_curso[df_mes_en_curso['direction'] == 'IN'])
+        out_mes = len(df_mes_en_curso[df_mes_en_curso['direction'] == 'OUT'])
+        
         # Contactos Únicos (Unique user IDs)
-        # Corregido: La lógica ahora funciona ya que el userId se extrae robustamente en procesar_dataframe
         if 'userId' in df_mes_en_curso.columns and df_mes_en_curso['userId'].notna().any():
             total_contactos_unicos_mes = df_mes_en_curso['userId'].nunique()
             total_contactos_unicos_hoy = df_hoy['userId'].nunique()
@@ -302,7 +339,12 @@ def cargar_datos_y_calcular_kpis():
         'otro_motivo': total_otro_motivo,
         'reclamo': total_reclamo,
         'conv_wp': conversion_whatsapp,
-        'meta_pv_acumulada': OBJETIVO_POS_VENTA_ACUMULADO
+        'meta_pv_acumulada': OBJETIVO_POS_VENTA_ACUMULADO,
+        'fecha_simulada': hoy_fecha,
+        'in_hoy': in_hoy,    # NUEVO
+        'out_hoy': out_hoy,  # NUEVO
+        'in_mes': in_mes,    # NUEVO
+        'out_mes': out_mes   # NUEVO
     }
 
 # Variables globales iniciales vacías para el layout (se llenarán con el primer callback)
@@ -386,12 +428,6 @@ def create_horizontal_bar(value):
 # Reemplazamos la llamada a create_gauge por la nueva función de barra horizontal.
 fig_horizontal_bar = create_horizontal_bar(conversion_whatsapp)
 
-
-# --- APP LAYOUT ---
-external_stylesheets = ['https://fonts.googleapis.com/css2?family=Open+Sans:wght@700&family=Arial&display=swap']
-app = dash.Dash(__name__, external_stylesheets=external_stylesheets, suppress_callback_exceptions=True) # <--- CORRECCIÓN DE ERROR 1
-server = app.server
-
 # Componente para las tarjetas KPI
 def tarjeta_kpi(titulo, valor, color_valor, ancho='23%'):
     return html.Div(style={
@@ -400,6 +436,31 @@ def tarjeta_kpi(titulo, valor, color_valor, ancho='23%'):
     }, children=[
         html.H3(titulo, style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '14px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
         html.H2(str(valor), style={'color': color_valor, 'fontSize': '28px', 'margin': '5px 0 0 0', 'fontFamily': 'Arial'})
+    ])
+
+# NUEVA Tarjeta KPI con detalle de IN/OUT (Punto 1)
+def tarjeta_conversacion_detalle(titulo, total, in_count, out_count, color_total, ancho='23%'):
+    
+    total = max(1, total) # Evitar división por cero
+    
+    p_in = round((in_count / total) * 100, 1)
+    p_out = round((out_count / total) * 100, 1)
+
+    return html.Div(style={
+        'backgroundColor': COLOR_KPI, 'padding': '15px', 'borderRadius': KPI_BORDER_RADIUS,
+        'boxShadow': KPI_BOX_SHADOW, 'width': ancho, 'textAlign': 'center', 'margin': '1%',
+        'height': '120px' # Aumentar la altura para el detalle
+    }, children=[
+        html.H3(titulo, style={'color': COLOR_TEXTO, 'margin': '0', 'fontSize': '14px', 'fontFamily': 'Open Sans', 'fontWeight': 'bold'}),
+        html.H2(str(total), style={'color': color_total, 'fontSize': '28px', 'margin': '5px 0 0 0', 'fontFamily': 'Arial'}),
+        
+        # Detalle de IN/OUT en la parte inferior
+        html.Div(style={'display': 'flex', 'justifyContent': 'center', 'marginTop': '5px', 'fontSize': '11px'}, children=[
+            html.Div(f"IN: {in_count} ({p_in}%)", 
+                     style={'color': DIRECTION_COLORS['IN'], 'marginRight': '10px'}),
+            html.Div(f"OUT: {out_count} ({p_out}%)", 
+                     style={'color': DIRECTION_COLORS['OUT']}),
+        ])
     ])
 
 # Controles de Orden
@@ -414,20 +475,6 @@ def control_orden(id_sufix, titulo, opciones):
         )
     ], style={'padding': '10px', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'marginBottom': '20px'})
 
-# Control para el nuevo gráfico de Rendimiento
-def control_rendimiento_pos():
-    return html.Div([
-        html.H4("Visualizar Rendimiento por PV", style={'color': COLOR_TEXTO, 'fontSize': '16px', 'fontFamily': 'Open Sans', 'marginTop': '10px'}),
-        dcc.RadioItems(
-            id='radio-pos-rendimiento-display',
-            options=[
-                {'label': 'Ventas (Cantidad)', 'value': 'CANTIDAD'},
-                {'label': 'Conversión (%)', 'value': 'PORCENTAJE'}
-            ],
-            value='CANTIDAD', # Valor por defecto: Cantidad de Ventas
-            labelStyle={'display': 'inline-block', 'marginRight': '20px', 'color': COLOR_TEXTO}
-        )
-    ], style={'padding': '10px', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'marginBottom': '20px'})
 
 # --- Layout de la Página Principal (Dashboard) ---
 layout_dashboard = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Arial', 'padding': '20px', 'minHeight': '100vh'}, children=[
@@ -439,26 +486,22 @@ layout_dashboard = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily':
     ),
     dcc.Store(id='df-storage', data=None), 
     dcc.Store(id='meta-pv-storage', data=OBJETIVO_POS_VENTA_ACUMULADO),
+    dcc.Store(id='simulated-date-storage', data=None), # NUEVO: Para guardar la fecha simulada.
 
     html.H1('Tablero de control Digital - Reino Cerámicos', 
             style={'textAlign': 'center', 'color': COLOR_TEXTO, 'fontFamily': 'Open Sans', 'fontWeight': 'bold', 'marginBottom': '5px'}),
     html.P(id='live-update-time', 
            style={'textAlign': 'center', 'color': '#aaaaaa', 'marginTop': '0'}),
            
-    # Botón de Navegación a la Página de Detalle
-    html.Div(style={'display': 'flex', 'justifyContent': 'center', 'margin': '10px'}, children=[
-        dcc.Link(html.Button('Ver Detalle de Contactos Hoy', id='btn-navigate-detalle', 
-            style={'backgroundColor': COLOR_BARRA_AZUL, 'color': COLOR_TEXTO, 'padding': '10px 20px', 
-                   'border': 'none', 'borderRadius': KPI_BORDER_RADIUS, 'cursor': 'pointer',
-                   'fontWeight': 'bold'}), href='/detalle'),
-    ]),
-
-
     # Fila 1 de KPIs: Conversaciones y Contactos Únicos (4 tarjetas)
     html.Div(id='kpi-row-1', style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[
-        tarjeta_kpi('Conversaciones Hoy', 0, '#17a2b8', ancho='20%'),
-        tarjeta_kpi('Conversaciones Acumuladas', 0, '#007bff', ancho='20%'),
+        # 1. Conversaciones Hoy (DETALLE IN/OUT)
+        tarjeta_conversacion_detalle('Conversaciones Hoy', 0, 0, 0, '#17a2b8', ancho='20%'),
+        # 2. Conversaciones Acumuladas (DETALLE IN/OUT)
+        tarjeta_conversacion_detalle('Conversaciones Acumuladas', 0, 0, 0, '#007bff', ancho='20%'),
+        # 3. Contactos Únicos Hoy
         tarjeta_kpi('Contactos Únicos Hoy', 0, '#00C4CC', ancho='20%'),
+        # 4. Contactos Únicos Acumulados
         tarjeta_kpi('Contactos Únicos Acumulados', 0, '#8000FF', ancho='20%'),
     ]),    
     
@@ -485,9 +528,13 @@ layout_dashboard = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily':
         control_orden('hora-asignacion-order', 'Visualizar hora de asignación de:', {'9 - 18hs': 'FIJO', 'Mayor a Menor': 'DESC'}),
     ]),
     
-    # Nuevo Control para Rendimiento PV
+    # NUEVOS CONTROLES para Gráficos de abajo
     html.Div(style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap', 'margin': '10px 0'}, children=[
-        control_rendimiento_pos()
+        # Control para Torta Tipificaciones (Punto 3)
+        control_orden('tipificacion-display', 'Tipificaciones (Typing)', {'Hoy': 'HOY', 'Mes': 'MES'}),
+        # Espaciador
+        html.Div(style={'width': '20px'}),
+        # Control para Estatus (Punto 2) - No requiere control de orden, el título es suficiente
     ]),
     
     # Gráficos de Contenido
@@ -497,165 +544,26 @@ layout_dashboard = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily':
         dcc.Graph(id='graph-dia-semana', style={'width': '48%', 'margin': '10px'}), 
         dcc.Graph(id='graph-hora-creacion', style={'width': '48%', 'margin': '10px'}), 
         dcc.Graph(id='graph-hora-asignacion', style={'width': '48%', 'margin': '10px'}), 
-        dcc.Graph(id='graph-pos-rendimiento', style={'width': '48%', 'margin': '10px'}), 
-        dcc.Graph(id='graph-agente-bar', style={'width': '48%', 'margin': '10px'}),
-    ])
-])
-
-# --- Layout de la Página de Detalle de Contactos (Página 2) ---
-layout_contactos_detalle = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Arial', 'padding': '20px', 'minHeight': '100vh'}, children=[
-    
-    html.H1('Detalle de Contactos Únicos (Hoy)', 
-            style={'textAlign': 'center', 'color': COLOR_TEXTO, 'fontFamily': 'Open Sans', 'fontWeight': 'bold', 'marginBottom': '20px'}),
-    
-    dcc.Link(html.Button('← Volver al Dashboard', 
-            style={'backgroundColor': COLOR_KPI, 'color': COLOR_TEXTO, 'padding': '10px 20px', 
-                   'border': 'none', 'borderRadius': KPI_BORDER_RADIUS, 'cursor': 'pointer',
-                   'fontWeight': 'bold', 'marginBottom': '20px'}), href='/'),
-                   
-    # Almacén de datos intermedio para la tabla (soluciona el error de Input non-existent)
-    dcc.Store(id='detalle-df-storage-raw', data=None), 
-                   
-    html.Div(id='detalle-filters', style={'display': 'flex', 'justifyContent': 'flex-start', 'gap': '20px', 'marginBottom': '20px'}, children=[
         
-        # Filtro por Estado
-        html.Div([
-            html.H4("Filtrar por Estado", style={'color': COLOR_TEXTO}),
-            dcc.Dropdown(
-                id='dropdown-status-filter',
-                placeholder="Seleccione Estado...",
-                style={'width': '300px', 'color': '#333'},
-            )
-        ]),
-        
-        # Filtro por Punto de Venta
-        html.Div([
-            html.H4("Filtrar por Punto de Venta", style={'color': COLOR_TEXTO}),
-            dcc.Dropdown(
-                id='dropdown-pv-filter',
-                placeholder="Seleccione Punto de Venta...",
-                style={'width': '300px', 'color': '#333'},
-            )
-        ]),
-    ]),
-    
-    # Tabla de Datos (se llenará con callback)
-    html.Div(id='table-container', children=[
-        dash_table.DataTable(
-            id='tabla-detalle',
-            style_table={'overflowX': 'auto', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS},
-            style_header={'backgroundColor': COLOR_BARRA_AZUL, 'color': 'white', 'fontWeight': 'bold'},
-            style_data={'backgroundColor': COLOR_KPI, 'color': COLOR_TEXTO, 'border': f'1px solid {COLOR_FONDO}'},
-            style_cell={'textAlign': 'left', 'padding': '12px'},
-            page_action='native',
-            page_size=20,
-            sort_action='native',
-            filter_action='native',
-            columns=[] # Se llenan en callback
-        )
+        # NUEVOS GRÁFICOS (Puntos 2, 3, 4)
+        dcc.Graph(id='graph-status', style={'width': '48%', 'margin': '10px'}), # Estatus (ACTIVO/FINALIZADO)
+        dcc.Graph(id='graph-tipificacion-torta', style={'width': '48%', 'margin': '10px'}), # Tipificaciones (Torta)
+        dcc.Graph(id='graph-ventas-agrupadas', style={'width': '97%', 'margin': '10px'}), # Venta/Conf/Perdida (Barras)
     ])
 ])
 
 
-# --- LAYOUT PRINCIPAL (Routing) ---
-app.layout = html.Div([
-    dcc.Location(id='url', refresh=False),
-    html.Div(id='page-content')
-])
+# --- APP LAYOUT (Definición de app y server) ---
+external_stylesheets = ['https://fonts.googleapis.com/css2?family=Open+Sans:wght@700&family=Arial&display=swap']
+app = dash.Dash(__name__, external_stylesheets=external_stylesheets, suppress_callback_exceptions=True) 
+server = app.server
+
+# ASIGNACIÓN DEL LAYOUT DESPUÉS DE LA CREACIÓN DE 'APP'
+app.layout = layout_dashboard 
 
 # -------------------------------------------------------------------
 # LÓGICA INTERACTIVA (CALLBACKS DE DASH)
 # -------------------------------------------------------------------
-
-# CALLBACK DE ROUTING: Muestra la página correcta
-@app.callback(Output('page-content', 'children'),
-              [Input('url', 'pathname')])
-def display_page(pathname):
-    if pathname == '/detalle':
-        return layout_contactos_detalle
-    else:
-        return layout_dashboard
-
-# CALLBACK INTERMEDIO: Transfiere y filtra los datos del día actual al store de detalle
-@app.callback(
-    Output('detalle-df-storage-raw', 'data'),
-    [Input('df-storage', 'data'),
-     Input('url', 'pathname')] # Asegura que se dispare cuando el layout cambia
-)
-def populate_detalle_store(data, pathname):
-    if pathname != '/detalle' or data is None:
-        # No estamos en la página de detalle o no hay datos cargados aún
-        return None 
-    
-    df_mes_en_curso_callback = parse_df_from_store(data)
-    if df_mes_en_curso_callback.empty:
-        return None
-
-    # Filtro: Solo contactos del día de hoy
-    hoy_fecha = datetime.now().date()
-    df_hoy = df_mes_en_curso_callback[df_mes_en_curso_callback['created'].dt.date == hoy_fecha].copy()
-    
-    # 1. Identificar la última conversación por userId (para listar contactos únicos)
-    if 'userId' in df_hoy.columns and df_hoy['userId'].notna().any():
-        # Ordenar por fecha de creación descendente y mantener solo la primera ocurrencia de userId
-        df_detalle = df_hoy.sort_values('created', ascending=False).drop_duplicates(subset=['userId']).copy()
-        # Seleccionar las columnas requeridas (mapeando client.id a userId)
-        df_detalle = df_detalle[[
-            'id', 'created', 'assigned', 'attentionHour', 'status', 
-            'direction', 'answerTime', 'agent.name', 'userId', 'client.name', 'note', 'PuntoDeVenta'
-        ]].rename(columns={'userId': 'client.id'}).copy()
-    else:
-        df_detalle = pd.DataFrame(columns=['id', 'created', 'assigned', 'attentionHour', 'status', 'direction', 'answerTime', 'agent.name', 'client.id', 'client.name', 'note', 'PuntoDeVenta'])
-
-    return df_detalle.to_json(date_format='iso', orient='split') if not df_detalle.empty else None
-
-# CALLBACK DE RECARGA DE DATOS (Dashboard)
-@app.callback(
-    [Output('df-storage', 'data'),
-     Output('meta-pv-storage', 'data'),
-     Output('live-update-time', 'children'),
-     Output('kpi-row-1', 'children'),
-     Output('kpi-row-2', 'children'),
-     Output('graph-conversion-wp', 'figure')],
-    [Input('interval-component', 'n_intervals')]
-)
-def update_data_and_kpis(n):
-    datos_actualizados = cargar_datos_y_calcular_kpis()
-    df_mes_en_curso_updated = datos_actualizados['df']
-    meta_pv_acumulada_updated = datos_actualizados['meta_pv_acumulada']
-    
-    # Reconstruir las filas KPI con los nuevos valores
-    kpi_row_1 = [
-        tarjeta_kpi('Conversaciones Hoy', datos_actualizados['conv_hoy'], '#17a2b8', ancho='20%'),
-        tarjeta_kpi('Conversaciones Acumuladas', datos_actualizados['conv_mes'], '#007bff', ancho='20%'),
-        tarjeta_kpi('Contactos Únicos Hoy', datos_actualizados['contactos_hoy'], '#00C4CC', ancho='20%'),
-        tarjeta_kpi('Contactos Únicos Acumulados', datos_actualizados['contactos_mes'], '#8000FF', ancho='20%'),
-    ]
-
-    kpi_row_2 = [
-        tarjeta_kpi('Ventas', datos_actualizados['venta'], '#28a745', ancho='15%'),
-        tarjeta_kpi('Ventas a Confirmar', datos_actualizados['venta_conf'], '#ffc107', ancho='15%'),
-        tarjeta_kpi('Ventas Perdidas', datos_actualizados['venta_perdida'], '#dc3545', ancho='15%'),
-        tarjeta_kpi('Otro Motivo', datos_actualizados['otro_motivo'], '#adb5bd', ancho='15%'),
-        tarjeta_kpi('Reclamos', datos_actualizados['reclamo'], '#fd7e14', ancho='15%'),
-    ]
-    
-    # Actualizar la barra de conversión de WhatsApp
-    fig_wp_updated = create_horizontal_bar(datos_actualizados['conv_wp'])
-    
-    # Actualizar la hora
-    time_str = f"Datos actualizados al: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-    
-    # Devolver el DataFrame serializado y la meta para que otros Callbacks los usen.
-    return (
-        df_mes_en_curso_updated.to_json(date_format='iso', orient='split') if not df_mes_en_curso_updated.empty else None,
-        meta_pv_acumulada_updated,
-        time_str,
-        kpi_row_1,
-        kpi_row_2,
-        fig_wp_updated
-    )
-
 
 def aplicar_estilos_grafico(fig):
     """ Función auxiliar para aplicar el tema oscuro a un gráfico. """
@@ -674,7 +582,6 @@ def parse_df_from_store(data):
         return pd.DataFrame()
     try:
         # CORRECCIÓN: Usar io.StringIO para evitar FutureWarning
-        # Asegurarse de que el input sea una cadena antes de envolver
         json_str = data if isinstance(data, str) else json.dumps(data)
         
         # Intenta leer el DF y convertir las columnas de fecha
@@ -690,6 +597,65 @@ def parse_df_from_store(data):
         return pd.DataFrame()
 
 
+# CALLBACK DE RECARGA DE DATOS (Dashboard) - Mantiene la lógica de carga y KPI
+@app.callback(
+    [Output('df-storage', 'data'),
+     Output('meta-pv-storage', 'data'),
+     Output('live-update-time', 'children'),
+     Output('kpi-row-1', 'children'),
+     Output('kpi-row-2', 'children'),
+     Output('graph-conversion-wp', 'figure'),
+     Output('simulated-date-storage', 'data')],
+    [Input('interval-component', 'n_intervals')]
+)
+def update_data_and_kpis(n):
+    datos_actualizados = cargar_datos_y_calcular_kpis()
+    df_mes_en_curso_updated = datos_actualizados['df']
+    meta_pv_acumulada_updated = datos_actualizados['meta_pv_acumulada']
+    fecha_simulada = datos_actualizados['fecha_simulada'].strftime('%Y-%m-%d') # Formato ISO para guardar
+    
+    # Reconstruir las filas KPI con los nuevos valores
+    kpi_row_1 = [
+        # Conversaciones Hoy (DETALLE IN/OUT)
+        tarjeta_conversacion_detalle('Conversaciones Hoy', datos_actualizados['conv_hoy'], 
+                                    datos_actualizados['in_hoy'], datos_actualizados['out_hoy'], 
+                                    '#17a2b8', ancho='20%'),
+        # Conversaciones Acumuladas (DETALLE IN/OUT)
+        tarjeta_conversacion_detalle('Conversaciones Acumuladas', datos_actualizados['conv_mes'], 
+                                    datos_actualizados['in_mes'], datos_actualizados['out_mes'], 
+                                    '#007bff', ancho='20%'),
+        # Contactos Únicos Hoy
+        tarjeta_kpi('Contactos Únicos Hoy', datos_actualizados['contactos_hoy'], '#00C4CC', ancho='20%'),
+        # Contactos Únicos Acumulados
+        tarjeta_kpi('Contactos Únicos Acumulados', datos_actualizados['contactos_mes'], '#8000FF', ancho='20%'),
+    ]
+
+    kpi_row_2 = [
+        tarjeta_kpi('Ventas', datos_actualizados['venta'], '#28a745', ancho='15%'),
+        tarjeta_kpi('Ventas a Confirmar', datos_actualizados['venta_conf'], '#ffc107', ancho='15%'),
+        tarjeta_kpi('Ventas Perdidas', datos_actualizados['venta_perdida'], '#dc3545', ancho='15%'),
+        tarjeta_kpi('Otro Motivo', datos_actualizados['otro_motivo'], '#adb5bd', ancho='15%'),
+        tarjeta_kpi('Reclamos', datos_actualizados['reclamo'], '#fd7e14', ancho='15%'),
+    ]
+    
+    # Actualizar la barra de conversión de WhatsApp
+    fig_wp_updated = create_horizontal_bar(datos_actualizados['conv_wp'])
+    
+    # Mensaje de fecha actualizado (mostrando la fecha real o simulada)
+    time_str = f"Datos actualizados al: {datetime.now().strftime('%d/%m/%Y %H:%M')} (Filtro 'Hoy': {fecha_simulada})"
+    
+    # Devolver el DataFrame serializado y la meta para que otros Callbacks los usen.
+    return (
+        df_mes_en_curso_updated.to_json(date_format='iso', orient='split') if not df_mes_en_curso_updated.empty else None,
+        meta_pv_acumulada_updated,
+        time_str,
+        kpi_row_1,
+        kpi_row_2,
+        fig_wp_updated,
+        fecha_simulada # Guardamos la fecha simulada
+    )
+
+
 # CALLBACK para Gráfico Diario (Requisito 9)
 @app.callback(
     Output('graph-diaria-mes', 'figure'),
@@ -702,17 +668,13 @@ def update_graph_diaria(data):
     if df_mes_en_curso_callback.empty: 
         return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos para el Mes")))
     
-    # --- 1. Crear el rango completo de días del mes ---
-    hoy = datetime.now()
-    if not df_mes_en_curso_callback.empty:
-        min_date_raw = df_mes_en_curso_callback['created'].min()
-        inicio_mes = min_date_raw.date() if pd.notna(min_date_raw) and min_date_raw.date().month == hoy.month else hoy.replace(day=1).date()
-    else:
-        inicio_mes = hoy.replace(day=1).date()
+    # --- 1. Crear el rango completo de días del mes (CORREGIDO: SIEMPRE HASTA HOY) ---
+    hoy_real = datetime.now()
+    inicio_mes = hoy_real.replace(day=1).date()
 
     
-    # Crear lista de fechas desde el inicio del mes hasta hoy
-    dates = [inicio_mes + timedelta(days=i) for i in range((hoy.date() - inicio_mes).days + 1)]
+    # Crear lista de fechas desde el inicio del mes hasta HOY REAL
+    dates = [inicio_mes + timedelta(days=i) for i in range((hoy_real.date() - inicio_mes).days + 1)]
     dates_str = [d.strftime('%d-%m') for d in dates]
     
     df_full_month = pd.DataFrame({'dia_mes_str': dates_str})
@@ -897,176 +859,114 @@ def update_graph_hora_asignacion(order_type, data):
     return aplicar_estilos_grafico(fig)
 
 
-# CALLBACK para Rendimiento por Punto de Venta (NUEVO GRÁFICO INTERACTIVO)
+# NUEVO CALLBACK: Gráfico de Estatus (Activas vs. Finalizadas) - Punto 2
 @app.callback(
-    Output('graph-pos-rendimiento', 'figure'),
-    [Input('radio-pos-rendimiento-display', 'value'),
-     Input('df-storage', 'data'),
-     Input('meta-pv-storage', 'data')]
+    Output('graph-status', 'figure'),
+    [Input('df-storage', 'data')]
 )
-def update_graph_pos_rendimiento(display_type, data, objetivo_acumulado):
+def update_graph_status(data):
     df_mes_en_curso_callback = parse_df_from_store(data)
-    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Rendimiento por Punto de Venta")))
-    
-    # Crear una lista única de todos los Puntos de Venta (PV) para asegurar la visibilidad de los PV con cero ventas
-    todos_los_pv = df_mes_en_curso_callback['PuntoDeVenta'].unique()
-    df_base = pd.DataFrame({'PuntoDeVenta': todos_los_pv})
-    
-    if display_type == 'CANTIDAD':
-        # --- MODO 1: Cantidad de Ventas (Typing='VENTA') ---
-        d_sales = df_mes_en_curso_callback[df_mes_en_curso_callback['typing'] == 'VENTA'].groupby('PuntoDeVenta').size().reset_index(name='Ventas')
-        
-        # Unir con la base de PV y rellenar nulos con 0
-        d_final = df_base.merge(d_sales, on='PuntoDeVenta', how='left').fillna(0)
-        d_final['Ventas'] = d_final['Ventas'].astype(int)
-        
-        # Ordenar de Mayor a Menor Cantidad de Ventas
-        d_final = d_final.sort_values('Ventas', ascending=False)
+    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Estatus")))
 
-        fig = px.bar(d_final, x='PuntoDeVenta', y='Ventas', 
-                     title="Ventas (Cantidad) por Punto de Venta (Mes)",
-                     color_discrete_sequence=[COLOR_BARRA_AZUL],
-                     text_auto=True)
-        
-        fig.update_yaxes(title_text="Ventas (Unidades)")
-        
-        # Lógica de la Línea Guía (Objetivo Acumulado) - Se aplica solo a la Cantidad
-        
-        fig.add_shape(
-            type="line",
-            xref="paper", yref="y",
-            x0=0, y0=objetivo_acumulado,
-            x1=1, y1=objetivo_acumulado,
-            line=dict(color="#fd7e14", width=2, dash="dot"),
-            name="Objetivo Acumulado"
-        )
-        fig.add_annotation(
-            x=0.9, y=objetivo_acumulado,
-            text=f"Meta Acumulada: {objetivo_acumulado}",
-            showarrow=False,
-            yanchor="bottom",
-            font=dict(color="#fd7e14", size=10)
-        )
-
-    else:
-        # --- MODO 2: Porcentaje de Conversión sobre Contactos Únicos ---
-        
-        # 1. Contar Ventas por PV
-        df_ventas = df_mes_en_curso_callback[df_mes_en_curso_callback['typing'] == 'VENTA'].groupby('PuntoDeVenta')['userId'].size().reset_index(name='Ventas')
-        
-        # 2. Contar Contactos Únicos por PV
-        df_contacts = df_mes_en_curso_callback.groupby('PuntoDeVenta')['userId'].nunique().reset_index(name='Contactos_Unicos')
-        
-        # 3. Unir Ventas y Contactos
-        d_calc = df_base.merge(df_ventas, on='PuntoDeVenta', how='left').fillna(0)
-        d_calc = d_calc.merge(df_contacts, on='PuntoDeVenta', how='left').fillna(0)
-        
-        # Calcular Porcentaje de Conversión
-        d_calc['Conversion'] = np.where(
-            d_calc['Contactos_Unicos'] > 0,
-            (d_calc['Ventas'] / d_calc['Contactos_Unicos']) * 100,
-            0
-        )
-        
-        # Ordenar de Mayor a Menor Porcentaje de Conversión
-        d_calc = d_calc.sort_values('Conversion', ascending=False)
-        
-        fig = px.bar(d_calc, x='PuntoDeVenta', y='Conversion', 
-                     title="Conversión (%) por PV (Ventas / Contactos Únicos)",
-                     color_discrete_sequence=[COLOR_BARRA_AZUL],
-                     text_auto='.2f') # Mostrar dos decimales para porcentaje
-
-        fig.update_yaxes(title_text="Conversión (%)", range=[0, d_calc['Conversion'].max() * 1.1])
+    # Clasificar el status: Activas (OPEN) vs. Finalizadas (CLOSED)
+    # Asumo que OPEN es la única activa y CLOSED/RESOLVED son finalizadas.
     
-    # Ajustes finales del gráfico
-    fig.update_xaxes(title_text="Punto de Venta")
-    return aplicar_estilos_grafico(fig)
-
-
-# CALLBACK para Agente (Barras) (Ordenado por defecto)
-@app.callback(
-    Output('graph-agente-bar', 'figure'),
-    [Input('df-storage', 'data')] 
-)
-def update_graph_agente(data):
-    df_mes_en_curso_callback = parse_df_from_store(data)
-    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Agente")))
+    # Normalizar los estados (ajusta esto si tus estados son diferentes)
+    df_mes_en_curso_callback['status_group'] = df_mes_en_curso_callback['status'].apply(
+        lambda s: 'ACTIVA' if s in ['OPEN', 'PENDING', 'ASSIGNED'] else 'FINALIZADA'
+    )
     
-    d = df_mes_en_curso_callback.groupby('agent.name').size().reset_index(name='conteo') # CORRECCIÓN APLICADA
-    d = d[d['conteo'] > 0] 
-    d = d.sort_values('conteo', ascending=False).head(15) # Limitar a los 15 principales para visibilidad
+    d = df_mes_en_curso_callback.groupby('status_group').size().reset_index(name='conteo')
     
-    fig = px.bar(d, x='agent.name', y='conteo', 
-                 title="Conversaciones por Agente (Mes) - Top 15",
-                 color_discrete_sequence=[COLOR_BARRA_AZUL],
+    # Definir colores específicos
+    status_colors = {'ACTIVA': '#FFC107', 'FINALIZADA': '#28a745'}
+    
+    fig = px.bar(d, x='status_group', y='conteo', 
+                 title="Estatus de Conversaciones (Activas vs. Finalizadas)",
+                 color='status_group',
+                 color_discrete_map=status_colors,
                  text_auto=True)
     
-    fig.update_xaxes(title_text="Agente")
+    fig.update_xaxes(title_text="Estatus")
+    fig.update_yaxes(title_text="Cantidad")
     return aplicar_estilos_grafico(fig)
 
 
-# CALLBACK para la Página de Detalle: Cargar y Filtrar la Tabla
+# NUEVO CALLBACK: Gráfico de Torta Tipificaciones (Punto 3)
 @app.callback(
-    [Output('tabla-detalle', 'columns'),
-     Output('tabla-detalle', 'data'),
-     Output('dropdown-status-filter', 'options'),
-     Output('dropdown-pv-filter', 'options')],
-    [Input('dropdown-status-filter', 'value'),
-     Input('dropdown-pv-filter', 'value')],
-    [State('detalle-df-storage-raw', 'data')] # <--- CORRECCIÓN CLAVE: Leer los datos desde State
+    Output('graph-tipificacion-torta', 'figure'),
+    [Input('radio-tipificacion-display', 'value'),
+     Input('df-storage', 'data'),
+     Input('simulated-date-storage', 'data')]
 )
-def update_detalle_table(selected_status, selected_pv, data):
-    # Usamos el DataFrame filtrado (solo contactos únicos de hoy)
-    # Se parsea el State que contiene el JSON del día actual
-    df_detalle = parse_df_from_store(data)
+def update_graph_tipificacion_torta(display_period, data, simulated_date):
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Tipificaciones")))
     
-    # Si el store está vacío (aún no se carga la data), retornar vacío.
-    if df_detalle.empty:
-        return ([], [], [], [])
-        
+    title_suffix = ""
     
-    # 1. Generar Opciones de Dropdown (siempre basadas en el DF completo del día)
-    status_options = [{'label': s, 'value': s} for s in df_detalle['status'].dropna().unique()]
-    pv_options = [{'label': pv, 'value': pv} for pv in df_detalle['PuntoDeVenta'].dropna().unique()]
-    
-    
-    # 2. Aplicar Filtros Interactivos (Status y PV)
-    df_filtrado = df_detalle.copy()
-    
-    # Nota: Los filtros se aplican solo a la vista actual, sin modificar las opciones disponibles
-    if selected_status:
-        df_filtrado = df_filtrado[df_filtrado['status'] == selected_status]
-        
-    if selected_pv:
-        df_filtrado = df_filtrado[df_filtrado['PuntoDeVenta'] == selected_pv]
+    if display_period == 'HOY':
+        # Filtrar por la fecha simulada para HOY
+        hoy_fecha = datetime.strptime(simulated_date, '%Y-%m-%d').date()
+        df_filtered = df_mes_en_curso_callback[df_mes_en_curso_callback['created'].dt.date == hoy_fecha]
+        title_suffix = f" (Hoy: {hoy_fecha.strftime('%d/%m')})"
+    else:
+        df_filtered = df_mes_en_curso_callback
+        title_suffix = " (Acumulado Mes)"
+
+    # Excluimos 'N/A' if there are other values, or if N/A is the only value
+    if df_filtered['typing'].nunique() > 1:
+        d = df_filtered[df_filtered['typing'] != 'N/A'].groupby('typing').size().reset_index(name='conteo')
+    else:
+        d = df_filtered.groupby('typing').size().reset_index(name='conteo')
+
+    fig = px.pie(d, names='typing', values='conteo',
+                 title="Tipificaciones (Typing)" + title_suffix,
+                 color_discrete_sequence=px.colors.sequential.Plasma_r)
+                 
+    fig.update_traces(textinfo='percent+label', marker=dict(line=dict(color=COLOR_KPI, width=1)))
+
+    return aplicar_estilos_grafico(fig)
 
 
-    # 3. Configurar Columnas de la Tabla
-    column_names = {
-        'id': 'ID Conversación',
-        'created': 'F. Creación',
-        'assigned': 'F. Asignación',
-        'attentionHour': 'H. Atención',
-        'status': 'Estado',
-        'direction': 'Dirección',
-        'answerTime': 'T. Respuesta',
-        'agent.name': 'Agente',
-        'client.id': 'ID Cliente',
-        'client.name': 'Nombre Cliente',
-        'note': 'Nota'
-    }
-    
-    # Crear la estructura de columnas para dash_table.DataTable
-    # La lista de columnas se basa en el DF completo del día (`df_detalle`) para garantizar que la estructura sea estable.
-    columns = [{"name": column_names.get(col, col), "id": col, "type": "datetime"}
-               if col in ['created', 'assigned'] else 
-               {"name": column_names.get(col, col), "id": col}
-               for col in df_detalle.columns if col != 'PuntoDeVenta'] 
+# NUEVO CALLBACK: Gráfico de Barras Agrupadas de Ventas (Punto 4)
+@app.callback(
+    Output('graph-ventas-agrupadas', 'figure'),
+    [Input('df-storage', 'data')]
+)
+def update_graph_ventas_agrupadas(data):
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Ventas Agrupadas")))
 
-    # 4. Formatear y preparar datos para la tabla
-    data_table = df_filtrado.to_dict('records')
+    # Filtrar solo las 3 tipificaciones de interés
+    tipificaciones_clave = ['VENTA', 'VENTA A CONFIRMAR', 'VENTA PERDIDA']
+    df_ventas = df_mes_en_curso_callback[df_mes_en_curso_callback['typing'].isin(tipificaciones_clave)].copy()
     
-    return (columns, data_table, status_options, pv_options)
+    # Contar la ocurrencia de cada tipificación
+    d = df_ventas.groupby('typing').size().reset_index(name='conteo')
+    
+    # Asegurar que las 3 tipificaciones estén presentes, incluso con conteo 0
+    df_full = pd.DataFrame({'typing': tipificaciones_clave})
+    d_final = df_full.merge(d, on='typing', how='left').fillna(0)
+    d_final['conteo'] = d_final['conteo'].astype(int)
+
+    # Definir colores específicos para las barras
+    venta_colors = {'VENTA': '#28a745', 'VENTA A CONFIRMAR': '#ffc107', 'VENTA PERDIDA': '#dc3545'}
+    
+    fig = px.bar(d_final, x='typing', y='conteo', 
+                 title="Tipificaciones de Ventas Clave (Venta - Venta a Confirmar - Venta Perdida)",
+                 color='typing',
+                 color_discrete_map=venta_colors,
+                 text_auto=True)
+    
+    fig.update_xaxes(title_text="Tipificación")
+    fig.update_yaxes(title_text="Cantidad")
+    return aplicar_estilos_grafico(fig)
+
+
+# Funciones de utilidad se mantienen (parse_df_from_store, aplicar_estilos_grafico)
+
+# ... (El resto de las funciones de utilidad y el main se mantienen sin cambios) ...
 
 
 if __name__ == '__main__':
