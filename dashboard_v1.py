@@ -1,5 +1,5 @@
 import dash
-from dash import dcc, html
+from dash import dcc, html, dash_table
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
@@ -135,7 +135,8 @@ def procesar_dataframe(raw_data):
     if 'assigned' in df.columns:
         df['assigned_dt'] = pd.to_datetime(df['assigned'], errors='coerce', unit='ms')
         df['assigned_dt'] = df['assigned_dt'].dt.tz_localize(None)
-        df['hora_asignacion'] = df['assigned_dt'].dt.hour
+        # Columna clave para el gráfico de asignación por hora
+        df['hora_asignacion'] = df['assigned_dt'].dt.hour 
     else:
         df['hora_asignacion'] = np.nan 
 
@@ -151,11 +152,12 @@ def procesar_dataframe(raw_data):
     # 4. Parseo de Agente y Punto de Venta (Lógica compleja)
     if 'agent' in df.columns:
         def get_agent_name(x):
-            if isinstance(x, dict): return x.get('name', 'Sin Agente')
-            return 'N/A' # Corregido: Si no hay agente, no se puede asignar PV.
+            if isinstance(x, dict): 
+                # Nuevo campo: nombre completo del agente (para la tabla detalle)
+                return x.get('name', 'Sin Agente')
+            return 'N/A'
         
-        # Usamos .apply(lambda x: x if isinstance(x, dict) else {'name': 'Sin Agente'}).str.get('name') para manejar nulos/cadenas
-        df['agentNameRaw'] = df['agent'].apply(get_agent_name).fillna('N/A')
+        df['agent.name'] = df['agent'].apply(get_agent_name).fillna('N/A')
         
         # Lógica de Parseo Rxx / VD
         def parse_agent(name_raw):
@@ -171,30 +173,35 @@ def procesar_dataframe(raw_data):
                 pos = f"Reino {match.group(1)[1:]}" if match else 'Otro'
             return pos, name_clean
 
-        # Filtrar solo si hay un agente válido para intentar el parseo
-        df_has_agent = df[df['agentNameRaw'] != 'N/A'].copy()
-        parsed = df_has_agent['agentNameRaw'].apply(parse_agent)
-        df_has_agent['PuntoDeVenta'] = parsed.apply(lambda x: x[0])
-        df_has_agent['NombreAgenteLimpio'] = parsed.apply(lambda x: x[1])
-
-        # Rellenar el DataFrame original
-        df['PuntoDeVenta'] = df.apply(lambda row: df_has_agent.loc[row.name, 'PuntoDeVenta'] if row.name in df_has_agent.index else 'N/A', axis=1)
-        df['NombreAgenteLimpio'] = df.apply(lambda row: df_has_agent.loc[row.name, 'NombreAgenteLimpio'] if row.name in df_has_agent.index else 'N/A', axis=1)
+        # Aplicar y asignar
+        parsed = df['agent.name'].apply(parse_agent)
+        df['PuntoDeVenta'] = parsed.apply(lambda x: x[0])
     else:
         df['PuntoDeVenta'] = 'N/A'
-        df['NombreAgenteLimpio'] = 'N/A'
+        df['agent.name'] = 'N/A' # Asegura que la columna exista
 
-    # 5. Extracción de ID de usuario para contactos únicos
+    # 5. Extracción de ID y nombre de usuario/cliente (Corregido y Fortalecido)
     if 'user' in df.columns:
-        def get_user_id(x):
-            if isinstance(x, dict): return x.get('id', None)
+        def get_user_data(x, key):
+            if isinstance(x, dict): return x.get(key, None)
             return None
-        df['userId'] = df['user'].apply(get_user_id)
+        # Corregido: Extracción robusta de user id
+        df['userId'] = df['user'].apply(lambda x: get_user_data(x, 'id'))
+        df['client.name'] = df['user'].apply(lambda x: get_user_data(x, 'name'))
     else:
         df['userId'] = None
+        df['client.name'] = None
+    
+    # 6. Extracción de otros campos para la tabla detalle (Punto 4)
+    df['id'] = df.get('id', pd.Series(dtype='object'))
+    df['attentionHour'] = df.get('attentionHour', pd.Series(dtype='object')) # Asumo que attentionHour está en el JSON si existe
+    df['status'] = df.get('status', 'N/A') # Estado de la conversación
+    df['direction'] = df.get('direction', 'N/A')
+    df['answerTime'] = df.get('answerTime', pd.Series(dtype='object'))
+    df['note'] = df.get('note', pd.Series(dtype='object'))
+    df['assigned'] = df.get('assigned', pd.Series(dtype='object')) # Raw timestamp para la tabla
 
-
-    # 6. Filtro por Mes en Curso
+    # 7. Filtro por Mes en Curso
     hoy = datetime.now()
     inicio_mes = hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     df_filtrado = df[df['created'] >= inicio_mes].copy()
@@ -256,7 +263,8 @@ def cargar_datos_y_calcular_kpis():
         total_conversaciones_hoy = len(df_hoy)
         
         # Contactos Únicos (Unique user IDs)
-        if 'userId' in df_mes_en_curso.columns and df_mes_en_curso['userId'].any():
+        # Corregido: La lógica ahora funciona ya que el userId se extrae robustamente en procesar_dataframe
+        if 'userId' in df_mes_en_curso.columns and df_mes_en_curso['userId'].notna().any():
             total_contactos_unicos_mes = df_mes_en_curso['userId'].nunique()
             total_contactos_unicos_hoy = df_hoy['userId'].nunique()
         
@@ -273,7 +281,8 @@ def cargar_datos_y_calcular_kpis():
             df_wp = df_mes_en_curso[df_mes_en_curso['channelType'] == 'WhatsApp']
             
             ventas_wp = len(df_wp[df_wp['typing'] == 'VENTA'])
-            contactos_unicos_wp = df_wp['userId'].nunique() if 'userId' in df_wp.columns else len(df_wp)
+            # Usar contactos únicos no nulos de WhatsApp
+            contactos_unicos_wp = df_wp['userId'].dropna().nunique() if 'userId' in df_wp.columns else len(df_wp)
             
             if contactos_unicos_wp > 0:
                 conversion_whatsapp = (ventas_wp / contactos_unicos_wp) * 100
@@ -419,57 +428,59 @@ def control_rendimiento_pos():
         )
     ], style={'padding': '10px', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'marginBottom': '20px'})
 
-
-app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Arial', 'padding': '20px', 'minHeight': '100vh'}, children=[
+# --- Layout de la Página Principal (Dashboard) ---
+layout_dashboard = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Arial', 'padding': '20px', 'minHeight': '100vh'}, children=[
     
-    # Componente oculto para recargar datos en el cliente
     dcc.Interval(
         id='interval-component',
         interval=30*60*1000, # 30 minutos en milisegundos
         n_intervals=0
     ),
+    dcc.Store(id='df-storage', data=None), 
+    dcc.Store(id='meta-pv-storage', data=OBJETIVO_POS_VENTA_ACUMULADO),
 
     html.H1('Tablero de control Digital - Reino Cerámicos', 
             style={'textAlign': 'center', 'color': COLOR_TEXTO, 'fontFamily': 'Open Sans', 'fontWeight': 'bold', 'marginBottom': '5px'}),
-    # La fecha de actualización ahora se actualiza vía callback
     html.P(id='live-update-time', 
            style={'textAlign': 'center', 'color': '#aaaaaa', 'marginTop': '0'}),
+           
+    # Botón de Navegación a la Página de Detalle
+    html.Div(style={'display': 'flex', 'justifyContent': 'center', 'margin': '10px'}, children=[
+        dcc.Link(html.Button('Ver Detalle de Contactos Hoy', id='btn-navigate-detalle', 
+            style={'backgroundColor': COLOR_BARRA_AZUL, 'color': COLOR_TEXTO, 'padding': '10px 20px', 
+                   'border': 'none', 'borderRadius': KPI_BORDER_RADIUS, 'cursor': 'pointer',
+                   'fontWeight': 'bold'}), href='/detalle'),
+    ]),
+
 
     # Fila 1 de KPIs: Conversaciones y Contactos Únicos (4 tarjetas)
     html.Div(id='kpi-row-1', style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[
-        # Inicialmente vacío o con datos base
-        tarjeta_kpi('Conversaciones Hoy', total_conversaciones_hoy, '#17a2b8', ancho='20%'),
-        tarjeta_kpi('Conversaciones Acumuladas', total_conversaciones_mes, '#007bff', ancho='20%'),
-        tarjeta_kpi('Contactos Únicos Hoy', total_contactos_unicos_hoy, '#00C4CC', ancho='20%'),
-        tarjeta_kpi('Contactos Únicos Acumulados', total_contactos_unicos_mes, '#8000FF', ancho='20%'),
+        tarjeta_kpi('Conversaciones Hoy', 0, '#17a2b8', ancho='20%'),
+        tarjeta_kpi('Conversaciones Acumuladas', 0, '#007bff', ancho='20%'),
+        tarjeta_kpi('Contactos Únicos Hoy', 0, '#00C4CC', ancho='20%'),
+        tarjeta_kpi('Contactos Únicos Acumulados', 0, '#8000FF', ancho='20%'),
     ]),    
     
     # Fila 2 de KPIs: Ventas y Clasificaciones (5 tarjetas)
     html.Div(id='kpi-row-2', style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[
-        # Inicialmente vacío o con datos base
-        tarjeta_kpi('Ventas', total_venta, '#28a745', ancho='15%'),
-        tarjeta_kpi('Ventas a Confirmar', total_venta_a_confirmar, '#ffc107', ancho='15%'),
-        tarjeta_kpi('Ventas Perdidas', total_venta_perdida, '#dc3545', ancho='15%'),
-        tarjeta_kpi('Otro Motivo', total_otro_motivo, '#adb5bd', ancho='15%'),
-        tarjeta_kpi('Reclamos', total_reclamo, '#fd7e14', ancho='15%'),
+        tarjeta_kpi('Ventas', 0, '#28a745', ancho='15%'),
+        tarjeta_kpi('Ventas a Confirmar', 0, '#ffc107', ancho='15%'),
+        tarjeta_kpi('Ventas Perdidas', 0, '#dc3545', ancho='15%'),
+        tarjeta_kpi('Otro Motivo', 0, '#adb5bd', ancho='15%'),
+        tarjeta_kpi('Reclamos', 0, '#fd7e14', ancho='15%'),
     ]),
 
-    # Fila 3 ahora solo contiene la barra horizontal de Conversión de WhatsApp
+    # Fila 3: Barra horizontal de Conversión de WhatsApp
     html.Div(id='kpi-row-3', style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap'}, children=[    
-        # 10. CONVERSIÓN WHATSAPP (Barra de Cumplimiento Horizontal)
-        html.Div(dcc.Graph(id='graph-conversion-wp', figure=fig_horizontal_bar, config={'displayModeBar': False}), 
+        html.Div(dcc.Graph(id='graph-conversion-wp', figure=create_horizontal_bar(0), config={'displayModeBar': False}), 
                  style={'width': '90%', 'height': '100px', 'margin': '1%', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS, 'boxShadow': KPI_BOX_SHADOW, 'padding': '5px'}),
     ]),
 
     # Controles Interactivos
     html.Div(style={'display': 'flex', 'justifyContent': 'space-around', 'flexWrap': 'wrap', 'margin': '20px 0'}, children=[
-        # Control para Torta Canal
         control_orden('canal-display', 'Participación por Canal', {'Cantidad': 'COUNT', 'Porcentaje': 'PERCENT'}),
-        # Control para Día Semana
         control_orden('dia-semana-order', 'Visualizar Conversaciones por día de:', {'Lunes - Domingo': 'FIJO', 'Mayor a Menor': 'DESC'}),
-        # Control para Hora Creación
         control_orden('hora-creacion-order', 'Visualizar hora de creación de:', {'00 - 23hs': 'FIJO', 'Mayor a Menor': 'DESC'}),
-        # Control para Hora Asignación
         control_orden('hora-asignacion-order', 'Visualizar hora de asignación de:', {'9 - 18hs': 'FIJO', 'Mayor a Menor': 'DESC'}),
     ]),
     
@@ -478,30 +489,90 @@ app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Aria
         control_rendimiento_pos()
     ]),
     
-    # Contenedor para almacenar el DF en memoria para los callbacks
-    # Se inicializan vacíos o con datos base. El callback de intervalo los llenará.
-    dcc.Store(id='df-storage', data=None), 
-    dcc.Store(id='meta-pv-storage', data=OBJETIVO_POS_VENTA_ACUMULADO),
-
-
-    # Gráficos de Contenido (Full Width / Half Width)
+    # Gráficos de Contenido
     html.Div(style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'center'}, children=[
         dcc.Graph(id='graph-diaria-mes', style={'width': '97%', 'margin': '10px'}), 
         dcc.Graph(id='graph-canal-torta', style={'width': '48%', 'margin': '10px'}), 
         dcc.Graph(id='graph-dia-semana', style={'width': '48%', 'margin': '10px'}), 
         dcc.Graph(id='graph-hora-creacion', style={'width': '48%', 'margin': '10px'}), 
         dcc.Graph(id='graph-hora-asignacion', style={'width': '48%', 'margin': '10px'}), 
-        # Gráfico ÚNICO de Rendimiento de Punto de Venta (Interactivo)
         dcc.Graph(id='graph-pos-rendimiento', style={'width': '48%', 'margin': '10px'}), 
         dcc.Graph(id='graph-agente-bar', style={'width': '48%', 'margin': '10px'}),
     ])
+])
+
+# --- Layout de la Página de Detalle de Contactos (Página 2) ---
+layout_contactos_detalle = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Arial', 'padding': '20px', 'minHeight': '100vh'}, children=[
+    
+    html.H1('Detalle de Contactos Únicos (Hoy)', 
+            style={'textAlign': 'center', 'color': COLOR_TEXTO, 'fontFamily': 'Open Sans', 'fontWeight': 'bold', 'marginBottom': '20px'}),
+    
+    dcc.Link(html.Button('← Volver al Dashboard', 
+            style={'backgroundColor': COLOR_KPI, 'color': COLOR_TEXTO, 'padding': '10px 20px', 
+                   'border': 'none', 'borderRadius': KPI_BORDER_RADIUS, 'cursor': 'pointer',
+                   'fontWeight': 'bold', 'marginBottom': '20px'}), href='/'),
+                   
+    html.Div(id='detalle-filters', style={'display': 'flex', 'justifyContent': 'flex-start', 'gap': '20px', 'marginBottom': '20px'}, children=[
+        
+        # Filtro por Estado
+        html.Div([
+            html.H4("Filtrar por Estado", style={'color': COLOR_TEXTO}),
+            dcc.Dropdown(
+                id='dropdown-status-filter',
+                placeholder="Seleccione Estado...",
+                style={'width': '300px', 'color': '#333'},
+            )
+        ]),
+        
+        # Filtro por Punto de Venta
+        html.Div([
+            html.H4("Filtrar por Punto de Venta", style={'color': COLOR_TEXTO}),
+            dcc.Dropdown(
+                id='dropdown-pv-filter',
+                placeholder="Seleccione Punto de Venta...",
+                style={'width': '300px', 'color': '#333'},
+            )
+        ]),
+    ]),
+    
+    # Tabla de Datos (se llenará con callback)
+    html.Div(id='table-container', children=[
+        dash_table.DataTable(
+            id='tabla-detalle',
+            style_table={'overflowX': 'auto', 'backgroundColor': COLOR_KPI, 'borderRadius': KPI_BORDER_RADIUS},
+            style_header={'backgroundColor': COLOR_BARRA_AZUL, 'color': 'white', 'fontWeight': 'bold'},
+            style_data={'backgroundColor': COLOR_KPI, 'color': COLOR_TEXTO, 'border': f'1px solid {COLOR_FONDO}'},
+            style_cell={'textAlign': 'left', 'padding': '12px'},
+            page_action='native',
+            page_size=20,
+            sort_action='native',
+            filter_action='native',
+            columns=[] # Se llenan en callback
+        )
+    ])
+])
+
+
+# --- LAYOUT PRINCIPAL (Routing) ---
+app.layout = html.Div([
+    dcc.Location(id='url', refresh=False),
+    html.Div(id='page-content')
 ])
 
 # -------------------------------------------------------------------
 # LÓGICA INTERACTIVA (CALLBACKS DE DASH)
 # -------------------------------------------------------------------
 
-# CALLBACK PRINCIPAL DE RECARGA DE DATOS (Se ejecuta en el cliente)
+# CALLBACK DE ROUTING: Muestra la página correcta
+@app.callback(Output('page-content', 'children'),
+              [Input('url', 'pathname')])
+def display_page(pathname):
+    if pathname == '/detalle':
+        return layout_contactos_detalle
+    else:
+        return layout_dashboard
+
+# CALLBACK DE RECARGA DE DATOS (Dashboard)
 @app.callback(
     [Output('df-storage', 'data'),
      Output('meta-pv-storage', 'data'),
@@ -512,8 +583,6 @@ app.layout = html.Div(style={'backgroundColor': COLOR_FONDO, 'fontFamily': 'Aria
     [Input('interval-component', 'n_intervals')]
 )
 def update_data_and_kpis(n):
-    # La lógica de carga de datos y cálculo de KPI se ejecuta aquí dentro.
-    
     datos_actualizados = cargar_datos_y_calcular_kpis()
     df_mes_en_curso_updated = datos_actualizados['df']
     meta_pv_acumulada_updated = datos_actualizados['meta_pv_acumulada']
@@ -592,12 +661,10 @@ def update_graph_diaria(data):
         return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos para el Mes")))
     
     # --- 1. Crear el rango completo de días del mes ---
-    # Usar la fecha máxima/mínima del DF si está disponible, sino usar hoy/inicio de mes
     hoy = datetime.now()
     if not df_mes_en_curso_callback.empty:
-        # Aseguramos que la columna 'created' es datetime antes de usar .min()
         min_date_raw = df_mes_en_curso_callback['created'].min()
-        inicio_mes = min_date_raw.date() if pd.notna(min_date_raw) else hoy.replace(day=1).date()
+        inicio_mes = min_date_raw.date() if pd.notna(min_date_raw) and min_date_raw.date().month == hoy.month else hoy.replace(day=1).date()
     else:
         inicio_mes = hoy.replace(day=1).date()
 
@@ -609,13 +676,11 @@ def update_graph_diaria(data):
     df_full_month = pd.DataFrame({'dia_mes_str': dates_str})
     
     # 2. Agrupación y cuenta de datos reales
-    # Contar conversaciones (total rows)
     d_real = df_mes_en_curso_callback.groupby('dia_mes_str').size().reset_index(name='conteo')
     
     # 3. Unir los datos reales con el rango completo y rellenar con 0
     d = df_full_month.merge(d_real, on='dia_mes_str', how='left').fillna(0)
     
-    # Asegurar que el conteo sea entero (para la etiqueta de datos)
     d['conteo'] = d['conteo'].astype(int)
     
     # Crear el gráfico
@@ -623,7 +688,7 @@ def update_graph_diaria(data):
                  title="Conversaciones Diarias (Mes en Curso)",
                  color_discrete_sequence=[COLOR_BARRA_AZUL],
                  text_auto=True,
-                 category_orders={'dia_mes_str': dates_str}) # Esto asegura el orden correcto
+                 category_orders={'dia_mes_str': dates_str}) 
     
     # Corregir la visualización del eje X a Categoría
     fig.update_xaxes(
@@ -752,7 +817,7 @@ def update_graph_hora_creacion(order_type, data):
     return aplicar_estilos_grafico(fig)
 
 
-# CALLBACK para Hora de Asignación (Requisito 13)
+# CALLBACK para Hora de Asignación (Requisito 13 - CORREGIDO)
 @app.callback(
     Output('graph-hora-asignacion', 'figure'),
     [Input('radio-hora-asignacion-order', 'value'),
@@ -762,12 +827,18 @@ def update_graph_hora_asignacion(order_type, data):
     df_mes_en_curso_callback = parse_df_from_store(data)
     if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Hora de Asignación")))
     
-    # Rango 9 a 18 (incluyendo 9 y 18)
-    d_fil = df_mes_en_curso_callback[(df_mes_en_curso_callback['hora_asignacion'] >= 9) & (df_mes_en_curso_callback['hora_asignacion'] <= 18)].copy()
+    # Usamos la columna 'hora_asignacion' (extraída de 'assigned') para el conteo.
+    # Filtramos solo registros donde hubo asignación (no nulos)
+    df_asignados = df_mes_en_curso_callback.dropna(subset=['hora_asignacion']).copy()
     
+    # Rango 9 a 18 (incluyendo 9 y 18)
+    d_fil = df_asignados[(df_asignados['hora_asignacion'] >= 9) & (df_asignados['hora_asignacion'] <= 18)].copy()
+    
+    # Contar las asignaciones por hora
     all_hours = pd.DataFrame({'hora_asignacion': range(9, 19)})
     d = d_fil.groupby('hora_asignacion').size().reset_index(name='conteo')
     d = all_hours.merge(d, on='hora_asignacion', how='left').fillna(0) # Rellenar horas sin datos con 0
+    d['hora_asignacion'] = d['hora_asignacion'].astype(int)
 
     if order_type == 'FIJO':
         fig = px.bar(d, x='hora_asignacion', y='conteo', 
@@ -880,17 +951,93 @@ def update_graph_agente(data):
     df_mes_en_curso_callback = parse_df_from_store(data)
     if df_mes_en_curso_callback.empty: return go.Figure(layout=aplicar_estilos_grafico(go.Layout(title="Sin Datos de Agente")))
     
-    d = df_mes_en_curso_callback.groupby('NombreAgenteLimpio').size().reset_index(name='conteo')
+    d = df_mes_en_curso_callback.groupby('agent.name').size().reset_index(name='conteo')
     d = d[d['conteo'] > 0] 
     d = d.sort_values('conteo', ascending=False).head(15) # Limitar a los 15 principales para visibilidad
     
-    fig = px.bar(d, x='NombreAgenteLimpio', y='conteo', 
+    fig = px.bar(d, x='agent.name', y='conteo', 
                  title="Conversaciones por Agente (Mes) - Top 15",
                  color_discrete_sequence=[COLOR_BARRA_AZUL],
                  text_auto=True)
     
     fig.update_xaxes(title_text="Agente")
     return aplicar_estilos_grafico(fig)
+
+
+# CALLBACK para la Página de Detalle: Cargar y Filtrar la Tabla
+@app.callback(
+    [Output('tabla-detalle', 'columns'),
+     Output('tabla-detalle', 'data'),
+     Output('dropdown-status-filter', 'options'),
+     Output('dropdown-pv-filter', 'options')],
+    [Input('df-storage', 'data'),
+     Input('dropdown-status-filter', 'value'),
+     Input('dropdown-pv-filter', 'value')]
+)
+def update_detalle_table(data, selected_status, selected_pv):
+    # Usamos el DataFrame completo cargado por el intervalo
+    df_mes_en_curso_callback = parse_df_from_store(data)
+    
+    if df_mes_en_curso_callback.empty:
+        return ([], [], [], [])
+        
+    # Filtro: Solo contactos del día de hoy
+    hoy_fecha = datetime.now().date()
+    df_hoy = df_mes_en_curso_callback[df_mes_en_curso_callback['created'].dt.date == hoy_fecha].copy()
+    
+    # 1. Identificar la última conversación por userId (para listar contactos únicos)
+    if 'userId' in df_hoy.columns:
+        # Ordenar por fecha de creación descendente y mantener solo la primera ocurrencia de userId
+        df_detalle = df_hoy.sort_values('created', ascending=False).drop_duplicates(subset=['userId'])
+        # Seleccionar las columnas requeridas (mapeando client.id a userId)
+        df_detalle = df_detalle[[
+            'id', 'created', 'assigned', 'attentionHour', 'status', 
+            'direction', 'answerTime', 'agent.name', 'userId', 'client.name', 'note', 'PuntoDeVenta'
+        ]].rename(columns={'userId': 'client.id'}).copy()
+    else:
+        df_detalle = pd.DataFrame(columns=['id', 'created', 'assigned', 'attentionHour', 'status', 'direction', 'answerTime', 'agent.name', 'client.id', 'client.name', 'note', 'PuntoDeVenta'])
+
+
+    # 2. Generar Opciones de Dropdown
+    status_options = [{'label': s, 'value': s} for s in df_detalle['status'].dropna().unique()]
+    pv_options = [{'label': pv, 'value': pv} for pv in df_detalle['PuntoDeVenta'].dropna().unique()]
+    
+    
+    # 3. Aplicar Filtros Interactivos (Status y PV)
+    df_filtrado = df_detalle.copy()
+    
+    if selected_status:
+        df_filtrado = df_filtrado[df_filtrado['status'] == selected_status]
+        
+    if selected_pv:
+        df_filtrado = df_filtrado[df_filtrado['PuntoDeVenta'] == selected_pv]
+
+
+    # 4. Configurar Columnas de la Tabla
+    column_names = {
+        'id': 'ID Conversación',
+        'created': 'F. Creación',
+        'assigned': 'F. Asignación',
+        'attentionHour': 'H. Atención',
+        'status': 'Estado',
+        'direction': 'Dirección',
+        'answerTime': 'T. Respuesta',
+        'agent.name': 'Agente',
+        'client.id': 'ID Cliente',
+        'client.name': 'Nombre Cliente',
+        'note': 'Nota'
+    }
+    
+    # Crear la estructura de columnas para dash_table.DataTable
+    columns = [{"name": column_names.get(col, col), "id": col, "type": "datetime"}
+               if col in ['created', 'assigned'] else 
+               {"name": column_names.get(col, col), "id": col}
+               for col in df_detalle.columns if col != 'PuntoDeVenta'] # Ocultamos PV, ya que se puede filtrar por él.
+
+    # 5. Formatear y preparar datos para la tabla
+    data_table = df_filtrado.to_dict('records')
+    
+    return (columns, data_table, status_options, pv_options)
 
 
 if __name__ == '__main__':
